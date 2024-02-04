@@ -441,8 +441,9 @@ func (m *Server) getTopology(w http.ResponseWriter, r *http.Request) {
 				nsView.MetaNodes = append(nsView.MetaNodes, proto.MetaNodeView{
 					ID: metaNode.ID, Addr: metaNode.Addr,
 					DomainAddr: metaNode.DomainAddr, Status: metaNode.IsActive,
-					IsWritable: metaNode.IsWriteAble(), MediaType: proto.MediaType_Unspecified,
+					IsWritable: metaNode.isWritable(proto.StoreModeMem), MediaType: proto.MediaType_Unspecified,
 					Ratio: metaNode.Ratio, SystemRatio: CaculateNodeMemoryRatio(metaNode),
+					IsRocksdbWritable: metaNode.isWritable(proto.StoreModeRocksDb),
 				})
 				return true
 			})
@@ -610,15 +611,21 @@ func (m *Server) getNodeSet(w http.ResponseWriter, r *http.Request) {
 	})
 	ns.metaNodes.Range(func(key, value interface{}) bool {
 		mn := value.(*MetaNode)
-		nsStat.MetaNodes = append(nsStat.MetaNodes, &proto.NodeStatView{
-			Addr:       mn.Addr,
-			Status:     mn.IsActive,
-			DomainAddr: mn.DomainAddr,
-			ID:         mn.ID,
-			IsWritable: mn.IsWriteAble(),
-			Total:      mn.Total,
-			Used:       mn.Used,
-			Avail:      mn.Total - mn.Used,
+		nsStat.MetaNodes = append(nsStat.MetaNodes, &proto.MetaNodeStatView{
+			NodeStatView: proto.NodeStatView{
+				Addr:       mn.Addr,
+				Status:     mn.IsActive,
+				DomainAddr: mn.DomainAddr,
+				ID:         mn.ID,
+				IsWritable: mn.isWritable(proto.StoreModeMem),
+				Total:      mn.Total,
+				Used:       mn.Used,
+				Avail:      mn.Total - mn.Used,
+			},
+			IsRocksdbWritable: mn.isWritable(proto.StoreModeRocksDb),
+			RocksdbTotal:      mn.GetRocksdbTotal(),
+			RocksdbUsed:       mn.GetRocksdbUsed(),
+			RocksdbAvali:      mn.GetRocksdbTotal() - mn.GetRocksdbUsed(),
 		})
 		return true
 	})
@@ -1928,6 +1935,7 @@ func (m *Server) addMetaReplica(w http.ResponseWriter, r *http.Request) {
 		partitionID uint64
 		allHosts    []string
 		err         error
+		storeMode   int
 	)
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminAddMetaReplica))
 	defer func() {
@@ -1936,6 +1944,17 @@ func (m *Server) addMetaReplica(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	if partitionID, addr, err = parseRequestToAddMetaReplica(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	storeMode, err = extractStoreMode(r)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+	if !(storeMode == int(proto.StoreModeMem) || storeMode == int(proto.StoreModeRocksDb) || storeMode == int(proto.StoreModeDef)) {
+		err = fmt.Errorf("storeMode can only be %d and %d,received storeMode is[%v]", proto.StoreModeMem, proto.StoreModeRocksDb, storeMode)
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
@@ -1953,7 +1972,7 @@ func (m *Server) addMetaReplica(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err = m.cluster.addMetaReplica(mp, addr); err != nil {
+	if err = m.cluster.addMetaReplica(mp, addr, proto.StoreMode(storeMode)); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
@@ -2597,6 +2616,11 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.storeMode, err = parseRocksDbFieldToUpdateVol(r, vol); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
 	newArgs := getVolVarargs(vol)
 	if err = parseArgs(r,
 		newArg("remoteCacheEnable", &newArgs.remoteCacheEnable).OmitEmpty(),
@@ -2656,6 +2680,10 @@ func (m *Server) updateVol(w http.ResponseWriter, r *http.Request) {
 	newArgs.trashInterval = req.trashInterval
 	newArgs.accessTimeValidInterval = req.accessTimeValidInterval
 	newArgs.enablePersistAccessTime = req.enablePersistAccessTime
+	newArgs.DefaultStoreMode = proto.StoreMode(req.storeMode)
+	if !newArgs.DefaultStoreMode.Valid() {
+		newArgs.DefaultStoreMode = vol.DefaultStoreMode
+	}
 	if req.coldArgs != nil {
 		newArgs.coldArgs = req.coldArgs
 	}
@@ -3021,6 +3049,10 @@ func (m *Server) checkCreateVolReq(req *createVolReq) (err error) {
 		return err
 	}
 
+	if !(req.storeMode == (proto.StoreModeMem) || req.storeMode == (proto.StoreModeRocksDb)) {
+		return fmt.Errorf("storeMode can only be %d and %d,received storeMode is[%v]", proto.StoreModeMem, proto.StoreModeRocksDb, req.storeMode)
+	}
+
 	return nil
 }
 
@@ -3238,6 +3270,7 @@ func newSimpleView(vol *Vol) (view *proto.SimpleVolView) {
 		FlashNodeTimeoutCount:        vol.flashNodeTimeoutCount,
 		RemoteCacheSameZoneTimeout:   vol.remoteCacheSameZoneTimeout,
 		RemoteCacheSameRegionTimeout: vol.remoteCacheSameRegionTimeout,
+		DefaultStoreMode:             vol.DefaultStoreMode,
 	}
 	view.AllowedStorageClass = make([]uint32, len(vol.allowedStorageClass))
 	copy(view.AllowedStorageClass, vol.allowedStorageClass)
@@ -4313,13 +4346,18 @@ func (m *Server) buildNodeSetGrpInfo(nsg *nodeSetGroup) *proto.SimpleNodeSetGrpI
 				ID:                 node.ID,
 				Addr:               node.Addr,
 				IsActive:           node.IsActive,
-				IsWriteAble:        node.IsWriteAble(),
+				IsWriteAble:        node.isWritable(proto.StoreModeMem),
+				IsRocksdbWritable:  node.isWritable(proto.StoreModeRocksDb),
 				ZoneName:           node.ZoneName,
 				MaxMemAvailWeight:  node.MaxMemAvailWeight,
 				Total:              node.Total,
 				Used:               node.Used,
+				RocksdbTotal:       node.GetRocksdbTotal(),
+				RocksdbUsed:        node.GetRocksdbUsed(),
 				Ratio:              node.Ratio,
 				SelectCount:        node.SelectCount,
+				MemorySelectCount:  node.SelectCount,
+				RocksdbSelectCount: node.SelectCount,
 				Threshold:          node.Threshold,
 				ReportTime:         node.ReportTime,
 				MetaPartitionCount: node.MetaPartitionCount,
@@ -5375,13 +5413,18 @@ func (m *Server) getMetaNode(w http.ResponseWriter, r *http.Request) {
 		RaftReplicaPort:           metaNode.ReplicaPort,
 		DomainAddr:                metaNode.DomainAddr,
 		IsActive:                  metaNode.IsActive,
-		IsWriteAble:               metaNode.IsWriteAble(),
+		IsWriteAble:               metaNode.isWritable(proto.StoreModeMem),
+		IsRocksdbWritable:         metaNode.isWritable(proto.StoreModeRocksDb),
 		ZoneName:                  metaNode.ZoneName,
 		MaxMemAvailWeight:         metaNode.MaxMemAvailWeight,
 		Total:                     metaNode.Total,
 		Used:                      metaNode.Used,
+		RocksdbTotal:              metaNode.GetRocksdbTotal(),
+		RocksdbUsed:               metaNode.GetRocksdbUsed(),
 		Ratio:                     metaNode.Ratio,
 		SelectCount:               metaNode.SelectCount,
+		MemorySelectCount:         metaNode.SelectCount,
+		RocksdbSelectCount:        metaNode.SelectCount,
 		Threshold:                 metaNode.Threshold,
 		ReportTime:                metaNode.ReportTime,
 		MetaPartitionCount:        metaNode.MetaPartitionCount,
@@ -5440,6 +5483,7 @@ func (m *Server) decommissionMetaPartition(w http.ResponseWriter, r *http.Reques
 		mp          *MetaPartition
 		msg         string
 		err         error
+		storeMode   int
 	)
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminDecommissionMetaPartition))
 	defer func() {
@@ -5451,11 +5495,23 @@ func (m *Server) decommissionMetaPartition(w http.ResponseWriter, r *http.Reques
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
+	storeMode, err = extractStoreMode(r)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	if !(storeMode == int(proto.StoreModeMem) || storeMode == int(proto.StoreModeRocksDb) || storeMode == int(proto.StoreModeDef)) {
+		err = fmt.Errorf("storeMode can only be %d and %d,received storeMode is[%v]", proto.StoreModeMem, proto.StoreModeRocksDb, storeMode)
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
 	if mp, err = m.cluster.getMetaPartitionByID(partitionID); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(proto.ErrMetaPartitionNotExists))
 		return
 	}
-	if err = m.cluster.decommissionMetaPartition(nodeAddr, mp); err != nil {
+	if err = m.cluster.decommissionMetaPartition(nodeAddr, mp, proto.StoreMode(storeMode)); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
@@ -5586,7 +5642,7 @@ func (m *Server) migrateMetaNodeHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if !targetNode.IsWriteAble() || !targetNode.PartitionCntLimited() {
+	if !targetNode.isWritable(proto.StoreModeMem) || !targetNode.PartitionCntLimited() {
 		err = fmt.Errorf("[%s] is not writable, can't used as target addr for migrate", targetAddr)
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
@@ -6168,6 +6224,21 @@ func getMetaPartitionView(mp *MetaPartition) (mpView *proto.MetaPartitionView) {
 	mpView.IsRecover = mp.IsRecover
 	mpView.Freeze = mp.Freeze
 	mpView.LastDelReplicaTime = mp.LastDelReplicaTime
+	mpView.StoreMode = mp.Replicas[0].StoreMode
+	for _, replica := range mp.Replicas {
+		if mpView.StoreMode != replica.StoreMode {
+			mpView.StoreMode = proto.StoreModeMem | proto.StoreModeRocksDb
+		}
+		switch replica.StoreMode {
+		case proto.StoreModeMem:
+			mpView.MemCount++
+		case proto.StoreModeRocksDb:
+			mpView.RocksCount++
+		default:
+			mpView.MemCount++
+		}
+	}
+
 	return
 }
 
@@ -6204,6 +6275,9 @@ func (m *Server) getMetaPartition(w http.ResponseWriter, r *http.Request) {
 				nodeSets[idx] = metaNode.NodeSetID
 			}
 		}
+		memCnt := uint8(0)
+		rocksCnt := uint8(0)
+		storeMode := proto.StoreModeDef
 		for i := 0; i < len(replicas); i++ {
 			replicas[i] = &proto.MetaReplicaInfo{
 				Addr:            mp.Replicas[i].Addr,
@@ -6217,7 +6291,16 @@ func (m *Server) getMetaPartition(w http.ResponseWriter, r *http.Request) {
 				DentryCount:     mp.Replicas[i].DentryCount,
 				MaxInode:        mp.Replicas[i].MaxInodeID,
 				ReadOnlyReasons: mp.Replicas[i].ReadOnlyReasons,
+				StoreMode:       mp.Replicas[i].StoreMode,
 			}
+			if mp.Replicas[i].StoreMode == proto.StoreModeMem {
+				memCnt++
+			}
+
+			if mp.Replicas[i].StoreMode == proto.StoreModeRocksDb {
+				rocksCnt++
+			}
+			storeMode |= mp.Replicas[i].StoreMode
 		}
 
 		forbidden := true
@@ -6251,6 +6334,9 @@ func (m *Server) getMetaPartition(w http.ResponseWriter, r *http.Request) {
 			StatByStorageClass:        mp.StatByStorageClass,
 			StatByMigrateStorageClass: mp.StatByMigrateStorageClass,
 			ForbidWriteOpOfProtoVer0:  mp.ForbidWriteOpOfProtoVer0,
+			MemStoreCnt:               memCnt,
+			RockStoreCnt:              rocksCnt,
+			StoreMode:                 storeMode,
 		}
 		return mpInfo
 	}
