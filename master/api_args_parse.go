@@ -1113,6 +1113,14 @@ func parseRequestToRemoveMetaReplica(r *http.Request) (ID uint64, addr string, e
 	return extractMetaPartitionIDAndAddr(r)
 }
 
+func parseRequestToAddMetaPartitionLearner(r *http.Request) (ID uint64, addr string, err error) {
+	return extractMetaPartitionIDAndAddr(r)
+}
+
+func parseRequestToPromoteMetaReplica(r *http.Request) (ID uint64, addr string, err error) {
+	return extractMetaPartitionIDAndAddr(r)
+}
+
 func extractMetaPartitionIDAndAddr(r *http.Request) (ID uint64, addr string, err error) {
 	if err = r.ParseForm(); err != nil {
 		return

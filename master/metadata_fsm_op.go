@@ -996,7 +996,13 @@ func (c *Cluster) syncAddMetaPartition(mp *MetaPartition) (err error) {
 }
 
 func (c *Cluster) syncUpdateMetaPartition(mp *MetaPartition) (err error) {
-	return c.putMetaPartitionInfo(opSyncUpdateMetaPartition, mp)
+	err = c.putMetaPartitionInfo(opSyncUpdateMetaPartition, mp)
+	if err != nil {
+		log.LogErrorf("action[syncUpdateMetaPartition] putMetaPartitionInfo failed,err[%v]", err)
+		return
+	}
+
+	return
 }
 
 func (c *Cluster) syncDeleteMetaPartition(mp *MetaPartition) (err error) {
