@@ -46,6 +46,7 @@ const (
 	AdminGetDataPartition                                  = "/dataPartition/get"
 	AdminLoadDataPartition                                 = "/dataPartition/load"
 	AdminCreateDataPartition                               = "/dataPartition/create"
+	AdminCreatePreLoadDataPartition                        = "/dataPartition/createPreLoad"
 	AdminDecommissionDataPartition                         = "/dataPartition/decommission"
 	AdminDiagnoseDataPartition                             = "/dataPartition/diagnose"
 	AdminResetDataPartitionDecommissionStatus              = "/dataPartition/resetDecommissionStatus"
@@ -127,6 +128,11 @@ const (
 	AdminUpdateDecommissionDiskLimit = "/admin/updateDecommissionDiskLimit"
 	AdminEnableAutoDecommissionDisk  = "/admin/enableAutoDecommissionDisk"
 	AdminQueryAutoDecommissionDisk   = "/admin/queryAutoDecommissionDisk"
+
+	AdminCancelDpDistributionOptimization          = "/admin/cancelDpDistributionOptimization"
+	AdminQueryDistributionOptimizationStatus       = "/admin/queryDistributionOptimizationStatus"
+	AdminSetDistributionOptimizationEnable         = "/admin/setDistributionOptimizationEnable"
+	AdminExecuteDistributionOptimizationMigrations = "/admin/executeDistributionOptimizationMigrations"
 	// graphql master api
 	AdminClusterAPI               = "/api/cluster"
 	AdminUserAPI                  = "/api/user"
@@ -234,6 +240,9 @@ const (
 	AdminAddMetaPartitionLearner       = "/metaPartition/addLearner"
 	AdminPromoteMetaReplica            = "/metaReplica/promote"
 	AdminPutDataPartitions             = "/dataPartitions/set"
+	AdminCreateStoreModeChangePlan     = "/metaPartition/createStoreModeChangePlan"
+	AdminBatchAddMpLearner             = "/metaPartition/batchAddLearner"
+	AdminBatchPromoteMpLearner         = "/metaPartition/batchPromoteLearner"
 
 	// admin multi version snapshot
 	AdminCreateVersion     = "/multiVer/create"
@@ -439,10 +448,15 @@ var GApiInfo map[string]string = map[string]string{
 	"usertransfervol":                 UserTransferVol,
 	"userlist":                        UserList,
 	"usersofvol":                      UsersOfVol,
+	"adminexecutedistributionoptimizationmigrations": AdminExecuteDistributionOptimizationMigrations,
+	"admincanceldpdistributionoptimization":          AdminCancelDpDistributionOptimization,
+	"adminquerydistributionoptimizationstatus":       AdminQueryDistributionOptimizationStatus,
+	"adminsetdistributionoptimizationenable":         AdminSetDistributionOptimizationEnable,
 }
 
 const (
 	MetaFollowerReadKey    = "metaFollowerRead"
+	MetaNearReadKey        = "metaNearRead"
 	MaximallyReadKey       = "maximallyRead"
 	LeaderRetryTimeoutKey  = "leaderRetryTimeout"
 	VolEnableDirectRead    = "directRead"
@@ -1025,6 +1039,7 @@ type MetaNodeHeartbeatResponse struct {
 	CpuUtil                          float64 `json:"cpuUtil"`
 	ReceivedForbidWriteOpOfProtoVer0 bool
 	RocksDBDiskInfo                  []*MetaNodeRocksdbInfo
+	RocksDBKeyNumMax                 uint64
 }
 
 // LcNodeHeartbeatResponse defines the response to the lc node heartbeat.
@@ -1382,6 +1397,7 @@ type SimpleVolView struct {
 	DpOfHDDCnt              int
 	FollowerRead            bool
 	MetaFollowerRead        bool
+	MetaNearRead            bool
 	DirectRead              bool
 	IgnoreTinyRecover       bool
 	MaximallyRead           bool
@@ -1446,6 +1462,8 @@ type SimpleVolView struct {
 
 	RemoteCacheRemoveDupReq bool // TODO: using it in metanode, origin was named EnableRemoveDupReq
 	DefaultStoreMode        StoreMode
+	RocksdbMpCount          uint64
+	MemoryMpCount           uint64
 }
 
 type NodeSetInfo struct {
@@ -1604,6 +1622,12 @@ const (
 	QueryDecommission // used for querying decommission progress for ManualDecommission and AutoDecommission
 	AutoAddReplica
 	ManualAddReplica
+	DistributionOptimization
+)
+
+const (
+	SelectType_Normal uint32 = iota
+	SelectType_DistributionOptimization
 )
 
 type BackupDataPartitionInfo struct {
@@ -1809,6 +1833,10 @@ const (
 	FreezedMetaPartition    = 2
 )
 
+const (
+	DefaultRack = "default"
+)
+
 type MetaNodeRocksdbInfo struct {
 	Path           string
 	Total          uint64
@@ -1816,4 +1844,30 @@ type MetaNodeRocksdbInfo struct {
 	UsageRatio     float64
 	Status         int8
 	PartitionCount int
+	KeyNum         uint64
+}
+
+type RackAwareLevel uint8
+
+const (
+	RackAwareNone RackAwareLevel = iota
+	RackAwareWeak
+	RackAwareStrong
+)
+
+func (l RackAwareLevel) String() string {
+	switch l {
+	case RackAwareNone:
+		return "none"
+	case RackAwareWeak:
+		return "weak"
+	case RackAwareStrong:
+		return "strong"
+	default:
+		return "unknown"
+	}
+}
+
+func (l RackAwareLevel) IsValid() bool {
+	return l >= RackAwareNone && l <= RackAwareStrong
 }

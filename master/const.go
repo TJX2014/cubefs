@@ -62,6 +62,7 @@ const (
 	akKey                                  = "ak"
 	keywordsKey                            = "keywords"
 	zoneNameKey                            = "zoneName"
+	rackKey                                = "rack" // 添加 rack 字段的 key
 	nodesetIdKey                           = "nodesetId"
 	crossZoneKey                           = "crossZone"
 	normalZonesFirstKey                    = "normalZonesFirst"
@@ -129,7 +130,6 @@ const (
 	ClientIDKey                            = "clientIDKey"
 	verSeqKey                              = "verSeq"
 	Periodic                               = "periodic"
-	DecommissionType                       = "decommissionType"
 	decommissionDiskLimit                  = "decommissionDiskLimit"
 	dpRepairBlockSizeKey                   = "dpRepairBlockSize"
 	markDiskBrokenThresholdKey             = "markDiskBrokenThreshold"
@@ -138,8 +138,12 @@ const (
 	autoDecommissionDiskIntervalKey        = "autoDecommissionDiskInterval"
 	autoDpMetaRepairKey                    = "autoDpMetaRepair"
 	autoDpMetaRepairParallelCntKey         = "autoDpMetaRepairParallelCnt"
+	autoDistributionOptimizationKey        = "autoDistributionOptimization"
+	distributionOptimizationConDpCntKey    = "distributionOptimizationConDpCnt"
+	distributionOptimizationThresholdKey   = "distributionOptimizationThreshold"
 	dpTimeoutKey                           = "dpTimeout"
 	mpTimeoutKey                           = "mpTimeout"
+	rackAwareLevelKey                      = "rackAware"
 	ShowAll                                = "showAll"
 	trashIntervalKey                       = "trashInterval"
 	accessTimeIntervalKey                  = "accessTimeValidInterval"
@@ -169,6 +173,8 @@ const (
 	remoteCacheSameRegionTimeout = "remoteCacheSameRegionTimeout"
 
 	StoreModeKey = "storeMode"
+	StartIdKey   = "start"
+	EndIdKey     = "end"
 )
 
 const (
@@ -542,7 +548,18 @@ const (
 	ManualPlan  = "manual"
 	AutoPlan    = "auto"
 	OfflinePlan = "offline"
+	ModifyStore = "modifyStoreMode"
+	AddLearner  = "addLearner"
 
 	CheckMetaLeaderRetry    = 10
 	CheckMetaLeaderInterval = 30
+	RetryCheckStatusNum     = 600
+	MaxInodePerMp           = 4000000
+	RetryDoMigrateNum       = 3
+	RetryMigrateInterVal    = 10
+	MaxMpMigrateNum         = 1000
+
+	PlanStatusIdle     = 0
+	PlanStatusRun      = 1
+	PlanStatusStopping = 2
 )
