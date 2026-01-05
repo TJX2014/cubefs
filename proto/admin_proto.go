@@ -111,6 +111,7 @@ const (
 	AdminQueryDecommissionToken            = "/admin/queryDecommissionToken"
 	AdminQueryDiskDecommissionInfoStat     = "/admin/queryDiskDecommissionInfoStat"
 	AdminQueryDataNodeDecommissionInfoStat = "/admin/queryDataNodeDecommissionInfoStat"
+	AdminQueryDpDecommissionStatus         = "/admin/queryDpDecommissionStatus"
 	AdminSetFileStats                      = "/admin/setFileStats"
 	AdminGetFileStats                      = "/admin/getFileStats"
 	AdminGetClusterValue                   = "/admin/getClusterValue"
@@ -240,9 +241,11 @@ const (
 	AdminAddMetaPartitionLearner       = "/metaPartition/addLearner"
 	AdminPromoteMetaReplica            = "/metaReplica/promote"
 	AdminPutDataPartitions             = "/dataPartitions/set"
-	AdminCreateStoreModeChangePlan     = "/metaPartition/createStoreModeChangePlan"
-	AdminBatchAddMpLearner             = "/metaPartition/batchAddLearner"
+	AdminBatchMigrateMp                = "/metaPartition/batchMigrate"
 	AdminBatchPromoteMpLearner         = "/metaPartition/batchPromoteLearner"
+	AdminGetPromoteMpLearnerPlan       = "/metaPartition/getPromoteLearnerPlan"
+	AdminCalcMetaPartitionMd5Sum       = "/metaPartition/calcMd5Sum"
+	AdminGetMd5SumResult               = "/metaPartition/getMd5SumResult"
 
 	// admin multi version snapshot
 	AdminCreateVersion     = "/multiVer/create"
@@ -1024,6 +1027,7 @@ type MetaPartitionReport struct {
 	LocalPeers                []Peer
 	ReadOnlyReasons           uint32
 	StoreMode                 StoreMode
+	IsLearner                 bool
 }
 
 // MetaNodeHeartbeatResponse defines the response to the meta node heartbeat request.
@@ -1170,6 +1174,8 @@ type MetaPartitionLoadResponse struct {
 	InodeCount  uint64
 	Addr        string
 	RaftInfo    RaftInfo
+	Md5ApplyId  uint64
+	Md5Sum      string
 }
 
 // DataPartitionResponse defines the response from a data node to the master that is related to a data partition.
@@ -1858,7 +1864,7 @@ const (
 func (l RackAwareLevel) String() string {
 	switch l {
 	case RackAwareNone:
-		return "none"
+		return "nolimit"
 	case RackAwareWeak:
 		return "weak"
 	case RackAwareStrong:
@@ -1868,6 +1874,32 @@ func (l RackAwareLevel) String() string {
 	}
 }
 
+// RecoverState represents the learner recovery state
+type RecoverState int
+
+const (
+	RecoverStateInit       RecoverState = 0 // Initial state
+	RecoverStateRecovering RecoverState = 1 // Recovering (IsRecover=true)
+	RecoverStateFailed     RecoverState = 2 // Recovery failed
+)
+
+func (s RecoverState) String() string {
+	switch s {
+	case RecoverStateInit:
+		return "Init"
+	case RecoverStateRecovering:
+		return "Recovering"
+	case RecoverStateFailed:
+		return "Failed"
+	default:
+		return "Unknown"
+	}
+}
+
 func (l RackAwareLevel) IsValid() bool {
 	return l >= RackAwareNone && l <= RackAwareStrong
+}
+
+type CalcMetaPartitionMd5SumRequest struct {
+	PartitionID uint64
 }

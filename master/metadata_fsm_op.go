@@ -15,8 +15,11 @@
 package master
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -26,6 +29,7 @@ import (
 
 	raftProto "github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	"github.com/cubefs/cubefs/proto"
+	pt "github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
 )
@@ -41,6 +45,7 @@ type clusterValue struct {
 	LoadFactor                             float32
 	DisableAutoAllocate                    bool
 	ForbidMpDecommission                   bool
+	EnableMpDecommissionByLearner          bool
 	DataNodeDeleteLimitRate                uint64
 	MetaNodeDeleteBatchCount               uint64
 	MetaNodeDeleteWorkerSleepMs            uint64
@@ -66,6 +71,9 @@ type clusterValue struct {
 	EnableAutoDecommissionDisk             bool
 	AutoDecommissionDiskInterval           int64
 	DecommissionDiskLimit                  uint32
+	EnableDistributionOptimization         bool
+	DistributionOptimizationConDpCnt       int64
+	DistributionOptimizationThreshold      float64
 	VolDeletionDelayTimeHour               int64
 	MetaNodeGOGC                           int
 	DataNodeGOGC                           int
@@ -82,11 +90,18 @@ type clusterValue struct {
 	AutoMpMigrate                          bool
 	FlashNodeHandleReadTimeout             int
 	FlashNodeReadDataNodeTimeout           int
+	RackAwareLevel                         uint8
 	FlashHotKeyMissCount                   int
 	FlashReadFlowLimit                     int64
 	FlashWriteFlowLimit                    int64
 	FlashKeyFlowLimit                      int64
 	RemoteClientFlowLimit                  int64
+	LearnerRecoverTimeoutSeconds           int64
+	DpLimitSsdBaseCount                    uint64
+	DpLimitSsdFactor                       uint64
+	DpLimitHddBaseCount                    uint64
+	DpLimitHddFactor                       uint64
+	DefaultVolStoreMode                    proto.StoreMode
 }
 
 func newClusterValue(c *Cluster) (cv *clusterValue) {
@@ -101,6 +116,7 @@ func newClusterValue(c *Cluster) (cv *clusterValue) {
 		DataNodeAutoRepairLimitRate:            c.cfg.DataNodeAutoRepairLimitRate,
 		DisableAutoAllocate:                    c.DisableAutoAllocate,
 		ForbidMpDecommission:                   c.ForbidMpDecommission,
+		EnableMpDecommissionByLearner:          c.EnableMpDecommissionByLearner,
 		MaxDpCntLimit:                          c.getMaxDpCntLimit(),
 		MaxMpCntLimit:                          c.getMaxMpCntLimit(),
 		FaultDomain:                            c.FaultDomain,
@@ -122,6 +138,9 @@ func newClusterValue(c *Cluster) (cv *clusterValue) {
 		EnableAutoDecommissionDisk:             c.EnableAutoDecommissionDisk.Load(),
 		AutoDecommissionDiskInterval:           c.AutoDecommissionInterval.Load(),
 		DecommissionDiskLimit:                  c.GetDecommissionDiskLimit(),
+		EnableDistributionOptimization:         c.getEnableDistributionOptimization(),
+		DistributionOptimizationConDpCnt:       c.DistributionOptimizationConDpCnt.Load(),
+		DistributionOptimizationThreshold:      getDistributionOptimizationThreshold(),
 		VolDeletionDelayTimeHour:               c.cfg.volDelayDeleteTimeHour,
 		MetaNodeGOGC:                           c.cfg.metaNodeGOGC,
 		DataNodeGOGC:                           c.cfg.dataNodeGOGC,
@@ -138,11 +157,18 @@ func newClusterValue(c *Cluster) (cv *clusterValue) {
 		AutoMpMigrate:                          c.cfg.AutoMpMigrate,
 		FlashNodeHandleReadTimeout:             c.cfg.flashNodeHandleReadTimeout,
 		FlashNodeReadDataNodeTimeout:           c.cfg.flashNodeReadDataNodeTimeout,
+		RackAwareLevel:                         uint8(c.cfg.RackAwareLevel),
 		FlashHotKeyMissCount:                   c.cfg.flashHotKeyMissCount,
 		FlashReadFlowLimit:                     c.cfg.flashReadFlowLimit,
 		FlashWriteFlowLimit:                    c.cfg.flashWriteFlowLimit,
 		FlashKeyFlowLimit:                      c.cfg.flashKeyFlowLimit,
 		RemoteClientFlowLimit:                  c.cfg.remoteClientFlowLimit,
+		LearnerRecoverTimeoutSeconds:           c.cfg.LearnerRecoverTimeoutSeconds,
+		DpLimitSsdBaseCount:                    c.cfg.DpLimitSsdBaseCount,
+		DpLimitSsdFactor:                       c.cfg.DpLimitSsdFactor,
+		DpLimitHddBaseCount:                    c.cfg.DpLimitHddBaseCount,
+		DpLimitHddFactor:                       c.cfg.DpLimitHddFactor,
+		DefaultVolStoreMode:                    c.cfg.DefaultVolStoreMode,
 	}
 	return cv
 }
@@ -161,6 +187,12 @@ type metaPartitionValue struct {
 	IsRecover          bool
 	Freeze             int8
 	LastDelReplicaTime int64
+	SrcAddr            string
+	LearnerDstAddr     string
+	RecoverStartTime   int64
+	RecoverFailCount   int
+	RecoverRetryTime   int64
+	RecoverState       int
 }
 
 func newMetaPartitionValue(mp *MetaPartition) (mpv *metaPartitionValue) {
@@ -178,6 +210,12 @@ func newMetaPartitionValue(mp *MetaPartition) (mpv *metaPartitionValue) {
 		IsRecover:          mp.IsRecover,
 		Freeze:             mp.Freeze,
 		LastDelReplicaTime: mp.LastDelReplicaTime,
+		SrcAddr:            mp.SrcAddr,
+		LearnerDstAddr:     mp.LearnerDstAddr,
+		RecoverStartTime:   mp.RecoverStartTime,
+		RecoverFailCount:   mp.RecoverFailCount,
+		RecoverRetryTime:   mp.RecoverRetryTime,
+		RecoverState:       int(mp.RecoverState),
 	}
 	return
 }
@@ -201,7 +239,9 @@ type dataPartitionValue struct {
 	DecommissionRetry               int
 	DecommissionStatus              uint32
 	DecommissionSrcAddr             string
+	DecommissionSrcAddrs            []string
 	DecommissionDstAddr             string
+	DecommissionDstAddrs            []string
 	DecommissionRaftForce           bool
 	DecommissionSrcDiskPath         string
 	DecommissionTerm                uint64
@@ -239,7 +279,9 @@ func (dpv *dataPartitionValue) Restore(c *Cluster) (dp *DataPartition) {
 	dp.IsDiscard = dpv.IsDiscard
 	dp.DecommissionRaftForce = dpv.DecommissionRaftForce
 	dp.DecommissionDstAddr = dpv.DecommissionDstAddr
+	dp.DecommissionDstAddrs = dpv.DecommissionDstAddrs
 	dp.DecommissionSrcAddr = dpv.DecommissionSrcAddr
+	dp.DecommissionSrcAddrs = dpv.DecommissionSrcAddrs
 	dp.DecommissionRetry = dpv.DecommissionRetry
 	dp.DecommissionStatus = dpv.DecommissionStatus
 	dp.DecommissionSrcDiskPath = dpv.DecommissionSrcDiskPath
@@ -302,7 +344,9 @@ func newDataPartitionValue(dp *DataPartition) (dpv *dataPartitionValue) {
 		DecommissionRetry:               dp.DecommissionRetry,
 		DecommissionStatus:              atomic.LoadUint32(&dp.DecommissionStatus),
 		DecommissionSrcAddr:             dp.DecommissionSrcAddr,
+		DecommissionSrcAddrs:            dp.DecommissionSrcAddrs,
 		DecommissionDstAddr:             dp.DecommissionDstAddr,
+		DecommissionDstAddrs:            dp.DecommissionDstAddrs,
 		DecommissionRaftForce:           dp.DecommissionRaftForce,
 		DecommissionSrcDiskPath:         dp.DecommissionSrcDiskPath,
 		DecommissionTerm:                dp.DecommissionTerm,
@@ -339,6 +383,7 @@ type volValue struct {
 	Owner                 string
 	FollowerRead          bool
 	MetaFollowerRead      bool
+	MetaNearRead          bool
 	DirectRead            bool
 	IgnoreTinyRecover     bool
 	MaximallyRead         bool
@@ -431,6 +476,7 @@ func newVolValue(vol *Vol) (vv *volValue) {
 		Owner:                   vol.Owner,
 		FollowerRead:            vol.FollowerRead,
 		MetaFollowerRead:        vol.MetaFollowerRead,
+		MetaNearRead:            vol.MetaNearRead,
 		DirectRead:              vol.DirectRead,
 		IgnoreTinyRecover:       vol.IgnoreTinyRecover,
 		MaximallyRead:           vol.MaximallyRead,
@@ -521,6 +567,7 @@ type dataNodeValue struct {
 	HeartbeatPort                      string
 	ReplicaPort                        string
 	ZoneName                           string
+	Rack                               string
 	RdOnly                             bool
 	DecommissionedDisks                []string
 	DecommissionSuccessDisks           []string
@@ -539,6 +586,8 @@ type dataNodeValue struct {
 	AllDisks                           []string
 	MediaType                          uint32
 	MaxDpCntLimit                      uint64
+	PreReservedSpace                   uint64
+	PreReservedDpCount                 uint32
 }
 
 func newDataNodeValue(dataNode *DataNode) *dataNodeValue {
@@ -549,7 +598,7 @@ func newDataNodeValue(dataNode *DataNode) *dataNodeValue {
 		HeartbeatPort:                      dataNode.HeartbeatPort,
 		ReplicaPort:                        dataNode.ReplicaPort,
 		ZoneName:                           dataNode.ZoneName,
-		RdOnly:                             dataNode.RdOnly,
+		Rack:                               dataNode.Rack,
 		DecommissionedDisks:                dataNode.getDecommissionedDisks(),
 		DecommissionSuccessDisks:           dataNode.getDecommissionSuccessDisks(),
 		DecommissionStatus:                 atomic.LoadUint32(&dataNode.DecommissionStatus),
@@ -561,12 +610,15 @@ func newDataNodeValue(dataNode *DataNode) *dataNodeValue {
 		DecommissionTime:                   dataNode.DecommissionTime,
 		DecommissionCompleteTime:           dataNode.DecommissionCompleteTime,
 		ToBeOffline:                        dataNode.ToBeOffline,
+		RdOnly:                             dataNode.RdOnly,
 		DecommissionDiskList:               dataNode.DecommissionDiskList,
 		DecommissionDpTotal:                dataNode.DecommissionDpTotal,
 		AllDisks:                           dataNode.AllDisks,
 		BadDisks:                           dataNode.BadDisks,
 		MediaType:                          dataNode.MediaType,
 		MaxDpCntLimit:                      dataNode.DpCntLimit,
+		PreReservedSpace:                   dataNode.PreReservedSpace,
+		PreReservedDpCount:                 dataNode.PreReservedDpCount,
 	}
 }
 
@@ -577,8 +629,11 @@ type metaNodeValue struct {
 	HeartbeatPort string
 	ReplicaPort   string
 	ZoneName      string
+	Rack          string
 	RdOnly        bool
 	maxMpCntLimit uint64
+	RocksdbRdOnly bool
+	SelectTag     string
 }
 
 func newMetaNodeValue(metaNode *MetaNode) *metaNodeValue {
@@ -589,8 +644,11 @@ func newMetaNodeValue(metaNode *MetaNode) *metaNodeValue {
 		HeartbeatPort: metaNode.HeartbeatPort,
 		ReplicaPort:   metaNode.ReplicaPort,
 		ZoneName:      metaNode.ZoneName,
+		Rack:          metaNode.Rack, // Save rack field
 		RdOnly:        metaNode.RdOnly,
 		maxMpCntLimit: metaNode.MpCntLimit,
+		RocksdbRdOnly: metaNode.RocksdbRdOnly,
+		SelectTag:     metaNode.SelectTag,
 	}
 }
 
@@ -1353,6 +1411,7 @@ func (c *Cluster) loadClusterValue() (err error) {
 		c.cfg.ClusterLoadFactor = cv.LoadFactor
 		c.DisableAutoAllocate = cv.DisableAutoAllocate
 		c.ForbidMpDecommission = cv.ForbidMpDecommission
+		c.EnableMpDecommissionByLearner = cv.EnableMpDecommissionByLearner
 		c.diskQosEnable = cv.DiskQosEnable
 		c.cfg.QosMasterAcceptLimit = cv.QosLimitUpload
 		c.DecommissionLimit = cv.DecommissionLimit // dont update nodesets limit for nodesets are not loaded
@@ -1365,9 +1424,24 @@ func (c *Cluster) loadClusterValue() (err error) {
 		c.EnableAutoDecommissionDisk.Store(cv.EnableAutoDecommissionDisk)
 		c.updateAutoDecommissionDiskInterval(cv.AutoDecommissionDiskInterval)
 		c.DecommissionLimit = cv.DecommissionLimit
+		c.updateEnableDistributionOptimization(cv.EnableDistributionOptimization)
+		if cv.DistributionOptimizationConDpCnt <= 0 {
+			cv.DistributionOptimizationConDpCnt = int64(defaultDistributionOptimizationConDpCnt)
+		}
+		if cv.DistributionOptimizationThreshold < 0 || cv.DistributionOptimizationThreshold > 1 {
+			cv.DistributionOptimizationThreshold = defaultDistributionOptimizationThreshold
+		}
+		c.DistributionOptimizationConDpCnt.Store(cv.DistributionOptimizationConDpCnt)
+		distributionOptimizationThreshold.Store(cv.DistributionOptimizationThreshold)
 		c.cfg.volDelayDeleteTimeHour = cv.VolDeletionDelayTimeHour
 		c.cfg.metaNodeGOGC = cv.MetaNodeGOGC
 		c.cfg.dataNodeGOGC = cv.DataNodeGOGC
+		c.cfg.RackAwareLevel = pt.RackAwareLevel(cv.RackAwareLevel)
+		if cv.LearnerRecoverTimeoutSeconds > 0 {
+			c.cfg.LearnerRecoverTimeoutSeconds = cv.LearnerRecoverTimeoutSeconds
+		} else {
+			c.cfg.LearnerRecoverTimeoutSeconds = defaultLearnerRecoverTimeout
+		}
 
 		if c.DecommissionFirstHostDiskParallelLimit == 0 {
 			c.DecommissionFirstHostDiskParallelLimit = defaultDecommissionFirstHostDiskParallelLimit
@@ -1453,6 +1527,31 @@ func (c *Cluster) loadClusterValue() (err error) {
 		c.cfg.flashNodeReadDataNodeTimeout = cv.FlashNodeReadDataNodeTimeout
 		log.LogInfof("action[loadClusterValue] flashNodeHandleReadTimeout %v(ms), flashNodeReadDataNodeTimeout %v(ms), flashHotKeyMissCount %v, flashReadFlowLimit %v, flashWriteFlowLimit %v, flashKeyFlowLimit %v, remoteClientFlowLimit %v",
 			cv.FlashNodeHandleReadTimeout, cv.FlashNodeReadDataNodeTimeout, cv.FlashHotKeyMissCount, cv.FlashReadFlowLimit, cv.FlashWriteFlowLimit, cv.FlashKeyFlowLimit, cv.RemoteClientFlowLimit)
+
+		if cv.DpLimitSsdBaseCount == 0 {
+			cv.DpLimitSsdBaseCount = defaultDpLimitSsdBaseCount
+		}
+		c.cfg.DpLimitSsdBaseCount = cv.DpLimitSsdBaseCount
+		if cv.DpLimitSsdFactor == 0 {
+			cv.DpLimitSsdFactor = defaultDpLimitSsdFactor
+		}
+		c.cfg.DpLimitSsdFactor = cv.DpLimitSsdFactor
+		if cv.DpLimitHddBaseCount == 0 {
+			cv.DpLimitHddBaseCount = defaultDpLimitHddBaseCount
+		}
+		c.cfg.DpLimitHddBaseCount = cv.DpLimitHddBaseCount
+		if cv.DpLimitHddFactor == 0 {
+			cv.DpLimitHddFactor = defaultDpLimitHddFactor
+		}
+		c.cfg.DpLimitHddFactor = cv.DpLimitHddFactor
+		log.LogInfof("action[loadClusterValue] dp limit params SSD(base=%d,factor=%d) HDD(base=%d,factor=%d)",
+			c.cfg.DpLimitSsdBaseCount, c.cfg.DpLimitSsdFactor, c.cfg.DpLimitHddBaseCount, c.cfg.DpLimitHddFactor)
+
+		if cv.DefaultVolStoreMode.Valid() {
+			c.cfg.DefaultVolStoreMode = cv.DefaultVolStoreMode
+		} else {
+			c.cfg.DefaultVolStoreMode = proto.StoreModeMem
+		}
 	}
 
 	return
@@ -1478,7 +1577,7 @@ func (c *Cluster) loadNodeSets() (err error) {
 			cap = c.cfg.nodeSetCapacity
 		}
 
-		ns := newNodeSet(c, nsv.ID, cap, nsv.ZoneName)
+		ns := newNodeSet(c, nsv.ID, cap, nsv.ZoneName, "")
 		ns.UpdateMaxParallel(int32(c.DecommissionLimit))
 		if nsv.DataNodeSelector != "" && ns.GetDataNodeSelector() != nsv.DataNodeSelector {
 			ns.SetDataNodeSelector(nsv.DataNodeSelector)
@@ -1663,6 +1762,9 @@ func (c *Cluster) loadDataNodes() (err error) {
 		if dnv.ZoneName == "" {
 			dnv.ZoneName = DefaultZoneName
 		}
+		if dnv.Rack == "" {
+			dnv.Rack = proto.DefaultRack
+		}
 
 		if dnv.MediaType == proto.MediaType_Unspecified {
 			dnv.MediaType = c.legacyDataMediaType
@@ -1670,7 +1772,7 @@ func (c *Cluster) loadDataNodes() (err error) {
 				dnv.Addr, proto.MediaTypeString(dnv.MediaType))
 		}
 
-		dataNode := newDataNode(dnv.Addr, dnv.HeartbeatPort, dnv.ReplicaPort, dnv.ZoneName, c.Name, dnv.MediaType)
+		dataNode := newDataNode(dnv.Addr, dnv.HeartbeatPort, dnv.ReplicaPort, dnv.ZoneName, dnv.Rack, c.Name, dnv.MediaType)
 		dataNode.ID = dnv.ID
 		dataNode.NodeSetID = dnv.NodeSetID
 		dataNode.RdOnly = dnv.RdOnly
@@ -1694,6 +1796,8 @@ func (c *Cluster) loadDataNodes() (err error) {
 		dataNode.BadDisks = dnv.BadDisks
 		dataNode.AllDisks = dnv.AllDisks
 		dataNode.DpCntLimit = dnv.MaxDpCntLimit
+		dataNode.PreReservedSpace = dnv.PreReservedSpace
+		dataNode.PreReservedDpCount = dnv.PreReservedDpCount
 		olddn, ok := c.dataNodes.Load(dataNode.Addr)
 		if ok {
 			if olddn.(*DataNode).ID <= dataNode.ID {
@@ -1702,6 +1806,7 @@ func (c *Cluster) loadDataNodes() (err error) {
 			}
 		}
 		c.dataNodes.Store(dataNode.Addr, dataNode)
+		c.t.putDataNode(dataNode)
 
 		log.LogInfof("action[loadDataNodes],dataNode[%v],dataNodeID[%v],MediaType[%v],zone[%v],ns[%v] DecommissionStatus [%v] "+
 			"DecommissionDstAddr[%v] DecommissionRaftForce[%v] DecommissionDpTotal[%v] DecommissionLimit[%v] DecommissionWeight[%v] DecommissionFirstHostParallelLimit[%v] DpCntLimit[%v]"+
@@ -1733,11 +1838,17 @@ func (c *Cluster) loadMetaNodes() (err error) {
 			mnv.ZoneName = DefaultZoneName
 		}
 
-		metaNode := newMetaNode(mnv.Addr, mnv.HeartbeatPort, mnv.ReplicaPort, mnv.ZoneName, c.Name)
+		if mnv.Rack == "" {
+			mnv.Rack = proto.DefaultRack
+		}
+
+		metaNode := newMetaNode(mnv.Addr, mnv.HeartbeatPort, mnv.ReplicaPort, mnv.ZoneName, mnv.Rack, c.Name)
 		metaNode.MpCntLimit = mnv.maxMpCntLimit
 		metaNode.ID = mnv.ID
 		metaNode.NodeSetID = mnv.NodeSetID
 		metaNode.RdOnly = mnv.RdOnly
+		metaNode.RocksdbRdOnly = mnv.RocksdbRdOnly
+		metaNode.SelectTag = mnv.SelectTag
 
 		oldmn, ok := c.metaNodes.Load(metaNode.Addr)
 		if ok {
@@ -1746,6 +1857,7 @@ func (c *Cluster) loadMetaNodes() (err error) {
 			}
 		}
 		c.metaNodes.Store(metaNode.Addr, metaNode)
+		c.t.putMetaNode(metaNode)
 		log.LogInfof("action[loadMetaNodes],metaNode[%v], metaNodeID[%v],zone[%v],ns[%v]", metaNode.Addr, metaNode.ID, mnv.ZoneName, mnv.NodeSetID)
 	}
 	return
@@ -1817,6 +1929,9 @@ func (c *Cluster) loadVols() (err error) {
 			continue
 		}
 		vol.Status = vv.Status
+		if vol.Status == proto.VolStatusInitializing {
+			vol.Status = proto.VolStatusInitFailed
+		}
 		if err = c.loadAclList(vol); err != nil {
 			log.LogInfof("action[loadVols],vol[%v] load acl manager error %v", vol.Name, err)
 			continue
@@ -1882,6 +1997,12 @@ func (c *Cluster) loadMetaPartitions() (err error) {
 		mp.IsRecover = mpv.IsRecover
 		mp.Freeze = mpv.Freeze
 		mp.LastDelReplicaTime = mpv.LastDelReplicaTime
+		mp.SrcAddr = mpv.SrcAddr
+		mp.LearnerDstAddr = mpv.LearnerDstAddr
+		mp.RecoverStartTime = mpv.RecoverStartTime
+		mp.RecoverFailCount = mpv.RecoverFailCount
+		mp.RecoverRetryTime = mpv.RecoverRetryTime
+		mp.RecoverState = proto.RecoverState(mpv.RecoverState)
 		vol.addMetaPartition(mp)
 		c.addBadMetaParitionIdMap(mp)
 		log.LogInfof("action[loadMetaPartitions],vol[%v],mp[%v]", vol.Name, mp.PartitionID)
@@ -1890,7 +2011,8 @@ func (c *Cluster) loadMetaPartitions() (err error) {
 }
 
 func (c *Cluster) addBadMetaParitionIdMap(mp *MetaPartition) {
-	if !mp.IsRecover {
+	// mp.RecoverState = proto.RecoverStateFailed need to clear state
+	if !mp.IsRecover && mp.RecoverState != proto.RecoverStateFailed {
 		return
 	}
 
@@ -2326,10 +2448,18 @@ func (c *Cluster) buildBalanceTaskRaftCmd(opType uint32, task *proto.ClusterPlan
 	balanceTask := new(RaftCmd)
 	balanceTask.Op = opType
 	balanceTask.K = balanceTaskKey
-	var err error
-	if balanceTask.V, err = json.Marshal(task); err != nil {
+	taskContent, err := json.Marshal(task)
+	if err != nil {
 		return nil, fmt.Errorf("balance task op(%d) encode err: %s", opType, err.Error())
 	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, err = gz.Write(taskContent)
+	if err != nil {
+		return nil, fmt.Errorf("balance task op(%d) encode err: %s", opType, err.Error())
+	}
+	gz.Close()
+	balanceTask.V = buf.Bytes()
 	return balanceTask, nil
 }
 
@@ -2343,8 +2473,20 @@ func (c *Cluster) loadBalanceTask() (*proto.ClusterPlan, error) {
 		return nil, proto.ErrNoMpMigratePlan
 	}
 
+	reader := bytes.NewReader(result)
+	gz, err := gzip.NewReader(reader)
+	if err != nil {
+		return nil, fmt.Errorf("loadBalanceTask decode gzip err: %s", err.Error())
+	}
+	defer gz.Close()
+
+	taskContent, err := io.ReadAll(gz)
+	if err != nil {
+		return nil, fmt.Errorf("loadBalanceTask decode gzip err: %s", err.Error())
+	}
+
 	task := new(proto.ClusterPlan)
-	err = json.Unmarshal(result, task)
+	err = json.Unmarshal(taskContent, task)
 	if err != nil {
 		return nil, fmt.Errorf("loadBalanceTask decode json err: %s", err.Error())
 	}
@@ -2378,4 +2520,138 @@ func (c *Cluster) loadFlashManualTasks() (err error) {
 		log.LogInfof("action[loadflashManualTask],vol[%v]", flt.VolName)
 	}
 	return
+}
+
+func (c *Cluster) syncAddCheckSumPlan(plan *proto.MetaPartitionsChecksumPlan) (err error) {
+	return c.putCheckSumPlanInfo(opSyncAddCheckSumPlan, plan)
+}
+
+func (c *Cluster) syncUpdateCheckSumPlan(plan *proto.MetaPartitionsChecksumPlan) (err error) {
+	return c.putCheckSumPlanInfo(opSyncUpdateCheckSumPlan, plan)
+}
+
+func (c *Cluster) putCheckSumPlanInfo(opType uint32, plan *proto.MetaPartitionsChecksumPlan) (err error) {
+	planTask := new(RaftCmd)
+	planTask.Op = opType
+	planTask.K = checkSumPlanKey
+	taskContent, err := json.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("check sum plan op(%d) encode err: %s", opType, err.Error())
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, err = gz.Write(taskContent)
+	if err != nil {
+		return fmt.Errorf("zip checksum plan op(%d) err: %s", opType, err.Error())
+	}
+	gz.Close()
+	planTask.V = buf.Bytes()
+
+	return c.submit(planTask)
+}
+
+func (c *Cluster) loadCheckSumPlan() (*proto.MetaPartitionsChecksumPlan, error) {
+	result, err := c.fsm.store.GetByKey([]byte(checkSumPlanKey))
+	if err != nil {
+		return nil, fmt.Errorf("loadCheckSumPlan GetByKey err: %s", err.Error())
+	}
+
+	if len(result) == 0 {
+		return nil, proto.ErrNoCheckSumPlan
+	}
+
+	reader := bytes.NewReader(result)
+	gz, err := gzip.NewReader(reader)
+	if err != nil {
+		return nil, fmt.Errorf("loadCheckSumPlan decode gzip err: %s", err.Error())
+	}
+	defer gz.Close()
+
+	taskContent, err := io.ReadAll(gz)
+	if err != nil {
+		return nil, fmt.Errorf("loadCheckSumPlan decode gzip err: %s", err.Error())
+	}
+
+	task := new(proto.MetaPartitionsChecksumPlan)
+	err = json.Unmarshal(taskContent, task)
+	if err != nil {
+		return nil, fmt.Errorf("loadCheckSumPlan decode json err: %s", err.Error())
+	}
+
+	return task, nil
+}
+
+func (c *Cluster) syncDeleteCheckSumPlan() error {
+	err := c.fsm.store.DelByKey([]byte(checkSumPlanKey), true)
+	if err != nil {
+		log.LogErrorf("DelByKey err: %s", err.Error())
+	}
+	return err
+}
+
+func (c *Cluster) syncAddPromoteLearnerPlan(plan *proto.PromoteLearnerPlan) (err error) {
+	return c.putPromoteLearnerPlanInfo(opSyncAddPromoteLearnerPlan, plan)
+}
+
+func (c *Cluster) syncUpdatePromoteLearnerPlan(plan *proto.PromoteLearnerPlan) (err error) {
+	return c.putPromoteLearnerPlanInfo(opSyncUpdatePromoteLearnerPlan, plan)
+}
+
+func (c *Cluster) putPromoteLearnerPlanInfo(opType uint32, plan *proto.PromoteLearnerPlan) (err error) {
+	planTask := new(RaftCmd)
+	planTask.Op = opType
+	planTask.K = promoteLearnerPlanKey
+	taskContent, err := json.Marshal(plan)
+	if err != nil {
+		return fmt.Errorf("promote learner plan op(%d) encode err: %s", opType, err.Error())
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, err = gz.Write(taskContent)
+	if err != nil {
+		return fmt.Errorf("zip promote learner plan op(%d) err: %s", opType, err.Error())
+	}
+	gz.Close()
+	planTask.V = buf.Bytes()
+
+	return c.submit(planTask)
+}
+
+func (c *Cluster) loadPromoteLearnerPlan() (*proto.PromoteLearnerPlan, error) {
+	result, err := c.fsm.store.GetByKey([]byte(promoteLearnerPlanKey))
+	if err != nil {
+		return nil, fmt.Errorf("loadPromoteLearnerPlan GetByKey err: %s", err.Error())
+	}
+
+	if len(result) == 0 {
+		return nil, proto.ErrNoPromoteLearnerPlan
+	}
+
+	reader := bytes.NewReader(result)
+	gz, err := gzip.NewReader(reader)
+	if err != nil {
+		return nil, fmt.Errorf("loadPromoteLearnerPlan decode gzip err: %s", err.Error())
+	}
+	defer gz.Close()
+
+	taskContent, err := io.ReadAll(gz)
+	if err != nil {
+		return nil, fmt.Errorf("loadPromoteLearnerPlan decode gzip err: %s", err.Error())
+	}
+
+	plan := new(proto.PromoteLearnerPlan)
+	err = json.Unmarshal(taskContent, plan)
+	if err != nil {
+		return nil, fmt.Errorf("loadPromoteLearnerPlan decode json err: %s", err.Error())
+	}
+
+	return plan, nil
+}
+
+func (c *Cluster) syncDeletePromoteLearnerPlan() error {
+	err := c.fsm.store.DelByKey([]byte(promoteLearnerPlanKey), true)
+	if err != nil {
+		log.LogErrorf("DelByKey err: %s", err.Error())
+	}
+	return err
 }

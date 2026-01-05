@@ -33,7 +33,6 @@ const (
 	MetaPartitionInodeSize  = 512
 	MetaPartitionDentrySize = 64
 	MetaPartitionMemMin     = 256 * 1024 * 1024
-	MaxLearnerNum           = 1
 )
 
 type GetMigrateAddrParam struct {
@@ -49,7 +48,10 @@ type GetMigrateAddrParam struct {
 	RackLevel    proto.RackAwareLevel
 }
 
-var NotEnoughResource = fmt.Errorf("not enough resource")
+var (
+	NotEnoughResource        = fmt.Errorf("not enough resource")
+	ErrClusterPlanNotRunning = fmt.Errorf("cluster plan is not running")
+)
 
 func (c *Cluster) FreezeEmptyMetaPartitionJob(name string, freezeList []*MetaPartition) error {
 	c.mu.Lock()
@@ -369,8 +371,22 @@ func (c *Cluster) GetLowMemPressureTopology(migratePlan *proto.ClusterPlan) erro
 
 	migratePlan.RackLevel = c.getRackAwareLevel()
 
-	zones := c.t.getAllZones()
+	var zones []*Zone
+	if migratePlan.SelectType == SelectTypeZoneName {
+		zone, err := c.t.getZone(migratePlan.ZoneName)
+		if zone == nil || err != nil {
+			err := fmt.Errorf("zone %s not found", migratePlan.ZoneName)
+			log.LogErrorf(err.Error())
+			return err
+		}
+		zones = make([]*Zone, 0, 1)
+		zones = append(zones, zone)
+	} else {
+		zones = c.t.getAllZones()
+	}
+
 	var nodeMemRatio float64
+	var nsc nodeSetCollection
 	for _, zone := range zones {
 		zoneView := &proto.ZonePressureView{
 			ZoneName: zone.name,
@@ -382,7 +398,19 @@ func (c *Cluster) GetLowMemPressureTopology(migratePlan *proto.ClusterPlan) erro
 			Status:   zone.getStatusToString(),
 			NodeSet:  make(map[uint64]*proto.NodeSetPressureView),
 		}
-		nsc := zone.getAllNodeSet()
+		if migratePlan.SelectType == SelectTypeNodeSetId {
+			ns, err := zone.getNodeSet(migratePlan.NodeSetID)
+			if ns == nil || err != nil {
+				log.LogErrorf("getNodeSet(%d) error: %s", migratePlan.NodeSetID, err.Error())
+				continue
+			}
+			nsc = make([]*nodeSet, 0, 1)
+			nsc = append(nsc, ns)
+			// set the zone name with node set id.
+			migratePlan.ZoneName = zone.name
+		} else {
+			nsc = zone.getAllNodeSet()
+		}
 		for _, ns := range nsc {
 			nsView := &proto.NodeSetPressureView{
 				NodeSetID: ns.ID,
@@ -396,6 +424,12 @@ func (c *Cluster) GetLowMemPressureTopology(migratePlan *proto.ClusterPlan) erro
 			rocksdbZoneView.NodeSet[ns.ID] = rocksdbNsView
 			ns.metaNodes.Range(func(key, value interface{}) bool {
 				metaNode := value.(*MetaNode)
+
+				if migratePlan.SelectType == SelectTypeNodeAddrs {
+					if metaNode.SelectTag != migratePlan.SelectTag {
+						return true
+					}
+				}
 
 				nodeMemRatio = CaculateNodeMemoryRatio(metaNode)
 				if nodeMemRatio > gConfig.metaNodeMemHighPer {
@@ -890,6 +924,8 @@ func UpdateLowPressureNodeTopo(migratePlan *proto.ClusterPlan, newPlan *proto.Mr
 }
 
 func FillExcludeAddrIntoGetParam(mpPlan *proto.MetaBalancePlan, getParam *GetMigrateAddrParam) {
+	getParam.Excludes = make([]string, 0, len(mpPlan.Original)+len(mpPlan.Plan))
+	getParam.ExcludeRacks = make([]string, 0, len(mpPlan.Original)+len(mpPlan.Plan))
 	for _, mrRec := range mpPlan.Original {
 		getParam.Excludes = append(getParam.Excludes, mrRec.Source)
 
@@ -948,6 +984,7 @@ func FindMigrateDestInOneNodeSet(migratePlan *proto.ClusterPlan, mpPlan *proto.M
 		return nil
 	}
 
+	FillExcludeAddrIntoGetParam(mpPlan, getParam)
 	// try to find resource from the mp member which has the same store mode.
 	err := TryNodeSetIdFromOtherNodes(migratePlan, mpPlan, getParam)
 	if err == nil {
@@ -957,9 +994,11 @@ func FindMigrateDestInOneNodeSet(migratePlan *proto.ClusterPlan, mpPlan *proto.M
 	DisplayPlanFailedDetails(getParam, mpPlan, migratePlan, isRocksdb)
 
 	// try the others node set under the same zone.
+	FillExcludeAddrIntoGetParam(mpPlan, getParam)
 	getParam.RequestNum = 3
 	find, dests = GetMigrateAddrExcludeNodeSet(getParam)
 	if !find {
+		FillExcludeAddrIntoGetParam(mpPlan, getParam)
 		find, dests = GetMigrateAddrExcludeZone(getParam)
 	}
 	if !find {
@@ -1017,18 +1056,18 @@ func GetMigrateDestAddr(param *GetMigrateAddrParam) (find bool, address []*proto
 	}
 
 	if !ok {
-		log.LogErrorf("Can't find zone: %s", param.ZoneName)
+		log.LogWarnf("Can't find zone: %s", param.ZoneName)
 		return
 	}
 
 	nodeSet, ok := zone.NodeSet[param.NodeSetID]
 	if !ok {
-		log.LogErrorf("Can't find node set: %d", param.NodeSetID)
+		log.LogWarnf("Can't find node set: %d", param.NodeSetID)
 		return
 	}
 
 	if nodeSet.Number < param.RequestNum {
-		log.LogErrorf("RequestNum: %d, but node set: %d only has %d free nodes", param.RequestNum, param.NodeSetID, nodeSet.Number)
+		log.LogWarnf("RequestNum: %d, but node set: %d only has %d free nodes", param.RequestNum, param.NodeSetID, nodeSet.Number)
 		return
 	}
 
@@ -1110,9 +1149,14 @@ func GetMigrateDestAddr(param *GetMigrateAddrParam) (find bool, address []*proto
 }
 
 func GetMigrateAddrExcludeNodeSet(param *GetMigrateAddrParam) (find bool, address []*proto.MrBalanceInfo) {
-	zone, ok := param.Topo[param.ZoneName]
+	zoneMap := param.Topo
+	if param.IsRocksdb {
+		zoneMap = param.RocksdbTopo
+	}
+
+	zone, ok := zoneMap[param.ZoneName]
 	if !ok {
-		log.LogErrorf("Can't find zone: %s", param.ZoneName)
+		log.LogWarnf("Can't find zone: %s", param.ZoneName)
 		return
 	}
 
@@ -1120,15 +1164,19 @@ func GetMigrateAddrExcludeNodeSet(param *GetMigrateAddrParam) (find bool, addres
 		if nodeSet.NodeSetID == param.NodeSetID {
 			continue
 		}
+		excludes := append([]string(nil), param.Excludes...)
+		excludeRacks := append([]string(nil), param.ExcludeRacks...)
 		newParam := &GetMigrateAddrParam{
-			Topo:        param.Topo,
-			RocksdbTopo: param.RocksdbTopo,
-			ZoneName:    param.ZoneName,
-			NodeSetID:   nodeSet.NodeSetID,
-			Excludes:    param.Excludes,
-			RequestNum:  param.RequestNum,
-			LeastSize:   param.LeastSize,
-			IsRocksdb:   param.IsRocksdb,
+			Topo:         param.Topo,
+			RocksdbTopo:  param.RocksdbTopo,
+			ZoneName:     param.ZoneName,
+			NodeSetID:    nodeSet.NodeSetID,
+			Excludes:     excludes,
+			ExcludeRacks: excludeRacks,
+			RequestNum:   param.RequestNum,
+			LeastSize:    param.LeastSize,
+			IsRocksdb:    param.IsRocksdb,
+			RackLevel:    param.RackLevel,
 		}
 		find, address = GetMigrateDestAddr(newParam)
 		if find {
@@ -1136,27 +1184,36 @@ func GetMigrateAddrExcludeNodeSet(param *GetMigrateAddrParam) (find bool, addres
 		}
 	}
 
-	log.LogErrorf("requestNum(%d) zone(%s) not enough resource in the same zone.", param.RequestNum, param.ZoneName)
+	log.LogWarnf("requestNum(%d) zone(%s) not enough resource in the same zone.", param.RequestNum, param.ZoneName)
 	find = false
 	return
 }
 
 func GetMigrateAddrExcludeZone(param *GetMigrateAddrParam) (find bool, address []*proto.MrBalanceInfo) {
-	for _, zone := range param.Topo {
+	zoneMap := param.Topo
+	if param.IsRocksdb {
+		zoneMap = param.RocksdbTopo
+	}
+
+	for _, zone := range zoneMap {
 		if zone.ZoneName == param.ZoneName {
 			continue
 		}
 
 		for _, nodeSet := range zone.NodeSet {
+			excludes := append([]string(nil), param.Excludes...)
+			excludeRacks := append([]string(nil), param.ExcludeRacks...)
 			newParam := &GetMigrateAddrParam{
-				Topo:        param.Topo,
-				RocksdbTopo: param.RocksdbTopo,
-				ZoneName:    zone.ZoneName,
-				NodeSetID:   nodeSet.NodeSetID,
-				Excludes:    param.Excludes,
-				RequestNum:  param.RequestNum,
-				LeastSize:   param.LeastSize,
-				IsRocksdb:   param.IsRocksdb,
+				Topo:         param.Topo,
+				RocksdbTopo:  param.RocksdbTopo,
+				ZoneName:     zone.ZoneName,
+				NodeSetID:    nodeSet.NodeSetID,
+				Excludes:     excludes,
+				ExcludeRacks: excludeRacks,
+				RequestNum:   param.RequestNum,
+				LeastSize:    param.LeastSize,
+				IsRocksdb:    param.IsRocksdb,
+				RackLevel:    param.RackLevel,
 			}
 			find, address = GetMigrateDestAddr(newParam)
 			if find {
@@ -1165,7 +1222,7 @@ func GetMigrateAddrExcludeZone(param *GetMigrateAddrParam) (find bool, address [
 		}
 	}
 
-	log.LogErrorf("RequestNum(%d) not enough resource in other zones.", param.RequestNum)
+	log.LogWarnf("RequestNum(%d) not enough resource in other zones.", param.RequestNum)
 	find = false
 	return
 }
@@ -1179,6 +1236,27 @@ func (c *Cluster) UpdateMigrateDestination(migratePlan *proto.ClusterPlan, mpPla
 	if err != nil {
 		log.LogErrorf("GetLowMemPressureTopology error: %s", err.Error())
 		return err
+	}
+
+	if migratePlan.Type == AddLearner {
+		param := &MetaPartitionPlanUserParams{
+			Mode:               migratePlan.Mode,
+			Count:              migratePlan.ModeCnt,
+			StartID:            migratePlan.StartId,
+			EndID:              migratePlan.EndId,
+			SelectType:         migratePlan.SelectType,
+			ZoneName:           migratePlan.ZoneName,
+			NodeSetID:          migratePlan.NodeSetID,
+			SelectTag:          migratePlan.SelectTag,
+			AutoPromoteLearner: migratePlan.AutoPromote,
+		}
+		err = c.AddLearnerToDestination(migratePlan, mpPlan, param)
+		if err != nil {
+			log.LogErrorf("AddLearnerToDestination error: %s", err.Error())
+			return err
+		}
+
+		return nil
 	}
 
 	// renew the planed destination meta node.
@@ -1236,12 +1314,19 @@ func (c *Cluster) DoMetaPartitionBalanceTask(plan *proto.ClusterPlan) {
 	}()
 
 	concurrency := gConfig.mpMigrateThreads
+	if concurrency <= 0 {
+		concurrency = 1
+	}
 	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		failMu sync.Mutex
+	)
 
-	stopProcess := false
+	var stopProcess uint32
+	atomic.StoreUint32(&stopProcess, 0)
 	for _, mpPlan := range plan.Plan {
-		if stopProcess {
+		if atomic.LoadUint32(&stopProcess) != 0 {
 			break
 		}
 		sem <- struct{}{}
@@ -1251,8 +1336,10 @@ func (c *Cluster) DoMetaPartitionBalanceTask(plan *proto.ClusterPlan) {
 			err := c.handleMetaPartitionPlan(plan, mpPlan)
 			if err != nil {
 				log.LogErrorf("handleMetaPartitionPlan err: %s", err.Error())
-				stopProcess = true
+				atomic.StoreUint32(&stopProcess, 1)
+				failMu.Lock()
 				plan.FailedList = append(plan.FailedList, mpPlan.ID)
+				failMu.Unlock()
 			}
 			<-sem
 		}(mpPlan)
@@ -1263,7 +1350,7 @@ func (c *Cluster) DoMetaPartitionBalanceTask(plan *proto.ClusterPlan) {
 		plan.Status = PlanTaskStop
 		plan.Msg = "migrate plan is stopped"
 	} else {
-		if stopProcess {
+		if atomic.LoadUint32(&stopProcess) != 0 {
 			plan.Status = PlanTaskError
 			plan.Msg = "Stop task because some meta partition failed. Please check the detail in each msg."
 		} else {
@@ -1289,6 +1376,10 @@ func (c *Cluster) DoMetaPartitionBalanceTask(plan *proto.ClusterPlan) {
 }
 
 func (c *Cluster) handleMetaPartitionPlan(plan *proto.ClusterPlan, mpPlan *proto.MetaBalancePlan) (err error) {
+	if c.IsClusterPlanNotRun() {
+		return ErrClusterPlanNotRunning
+	}
+
 	if VerifyMetaReplicaPlanNotAllInit(mpPlan) {
 		return nil
 	}
@@ -1344,6 +1435,10 @@ func (c *Cluster) handleMetaPartitionPlan(plan *proto.ClusterPlan, mpPlan *proto
 }
 
 func (c *Cluster) handleMetaReplicaPlan(plan *proto.ClusterPlan, mpPlan *proto.MetaBalancePlan, mp *MetaPartition, mrPlan *proto.MrBalanceInfo) (err error) {
+	if c.IsClusterPlanNotRun() {
+		return ErrClusterPlanNotRunning
+	}
+
 	// check the memory/rocksdb disk usage of destination metanode.
 	overLoad, err := c.VerifyMetaNodeExceedMemMid(mrPlan.Destination, plan.Mode)
 	if err != nil {
@@ -1351,7 +1446,13 @@ func (c *Cluster) handleMetaReplicaPlan(plan *proto.ClusterPlan, mpPlan *proto.M
 		return err
 	}
 	if overLoad {
-		return fmt.Errorf("destination metanode(%s) is overload before migrate mp(%v)", mrPlan.Destination, mpPlan.ID)
+		return fmt.Errorf("destination metanode(%s) can't allocate partition before migrate mp(%v)", mrPlan.Destination, mpPlan.ID)
+	}
+
+	err = c.waitForMetaPartitionReady(mp)
+	if err != nil {
+		log.LogErrorf("waitForMetaPartitionReady err: %s", err.Error())
+		return err
 	}
 
 	// Update raft storage.
@@ -1399,10 +1500,16 @@ func (c *Cluster) WaitForMetaPartitionMigrateDone(mp *MetaPartition, addr string
 	for i := 0; i < maxRetry; i++ {
 		select {
 		case <-ticker.C:
+			if c.IsClusterPlanNotRun() {
+				return ErrClusterPlanNotRunning
+			}
 			if mp.IsRecover {
 				continue
 			}
 			if !mp.isLeaderExist() {
+				continue
+			}
+			if mp.RecoverState != proto.RecoverStateInit {
 				continue
 			}
 			ready, err = CheckRaftStatus(mp, addr)
@@ -1526,6 +1633,14 @@ func (c *Cluster) scheduleStartBalanceTask() {
 				err := c.RestartMetaPartitionBalanceTask()
 				if err != nil && err != proto.ErrNoMpMigratePlan {
 					log.LogErrorf("RestartMetaPartitionBalanceTask err: %s", err.Error())
+				}
+				err = c.RestartMetaPartitionCheckSumTask()
+				if err != nil && err != proto.ErrNoCheckSumPlan {
+					log.LogErrorf("RestartMetaPartitionCheckSumTask err: %s", err.Error())
+				}
+				err = c.RestartPromoteLearnerPlan()
+				if err != nil && err != proto.ErrNoPromoteLearnerPlan {
+					log.LogErrorf("RestartPromoteLearnerPlan err: %s", err.Error())
 				}
 			case <-c.stopc:
 				return
@@ -2026,167 +2141,6 @@ func checkMetaReplicasIsRocksdb(mp *MetaPartition) bool {
 	return false
 }
 
-// CreateModifyMetaPartitionStoreModePlan creates a migration plan for meta partitions
-// startID and endID specify the range of partition IDs to migrate, 0 means no limit
-// targetMode specifies the target store mode to migrate to
-func (c *Cluster) CreateModifyMetaPartitionStoreModePlan(volName string, startID, endID uint64, targetMode proto.StoreMode, modeCnt int) (*proto.ClusterPlan, error) {
-	// Create a new meta partition migrate plan
-	plan := &proto.ClusterPlan{
-		Low:            make(map[string]*proto.ZonePressureView),
-		RocksdbLow:     make(map[string]*proto.ZonePressureView),
-		Plan:           make([]*proto.MetaBalancePlan, 0),
-		Status:         PlanTaskInit,
-		Type:           ModifyStore,
-		Mode:           targetMode,
-		ModeCnt:        modeCnt,
-		StartId:        startID,
-		EndId:          endID,
-		RackLevel:      c.getRackAwareLevel(),
-		FailedList:     make([]uint64, 0),
-		DoneNum:        0,
-		RunningNum:     0,
-		DoneReplicaNum: 0,
-		RunReplicaNum:  0,
-	}
-
-	err := c.GetLowMemPressureTopology(plan)
-	if err != nil {
-		log.LogErrorf("GetLowMemPressureTopology error: %s", err.Error())
-		return plan, err
-	}
-
-	err = c.FillModifyStoreModePlan(plan, volName)
-	if err != nil {
-		log.LogErrorf("FillModifyStoreModePlan error: %s", err.Error())
-		return plan, err
-	}
-
-	err = c.FindMigrateDestination(plan)
-	if err != nil {
-		log.LogErrorf("FindMigrateDestination error: %s", err.Error())
-		return plan, err
-	}
-	// remove unnecessary plans.
-	TrimMigrateMetaPartitionPlan(plan)
-
-	plan.Total = len(plan.Plan)
-	plan.UndoNum = int32(plan.Total)
-	for _, item := range plan.Plan {
-		plan.TotalReplicaNum += len(item.Plan)
-	}
-	plan.UndoReplicaNum = int32(plan.TotalReplicaNum)
-
-	if plan.Total <= 0 {
-		return nil, fmt.Errorf("no replicas need to be migrated in volume(%s)", volName)
-	}
-
-	// Save plan into raft storage
-	err = c.syncAddBalanceTask(plan)
-	if err != nil {
-		log.LogErrorf("syncAddBalanceTask err: %s", err.Error())
-		return nil, err
-	}
-
-	return plan, nil
-}
-
-func (c *Cluster) FillModifyStoreModePlan(plan *proto.ClusterPlan, volName string) error {
-	var mps map[uint64]*MetaPartition
-	if volName != "" {
-		vol, err := c.getVol(volName)
-		if err != nil {
-			return fmt.Errorf("get volume(%s) failed: %v", volName, err)
-		}
-
-		if vol.isUnavailable() {
-			return fmt.Errorf("volume(%s) is marked delete or init failed", volName)
-		}
-
-		mps = vol.cloneMetaPartitionMap()
-	} else {
-		mps = c.getAllMetaPartitions()
-	}
-
-	for _, mp := range mps {
-		// Check partition ID range
-		if plan.StartId != 0 && mp.PartitionID < plan.StartId {
-			continue
-		}
-		if plan.EndId != 0 && mp.PartitionID > plan.EndId {
-			continue
-		}
-		count := GetReplicasStoreModeCount(mp, plan.Mode)
-		if count >= plan.ModeCnt {
-			continue
-		}
-
-		mpPlan := &proto.MetaBalancePlan{
-			ID:         mp.PartitionID,
-			Original:   make([]*proto.MrBalanceInfo, 0),
-			Plan:       make([]*proto.MrBalanceInfo, 0),
-			InodeCount: mp.InodeCount,
-			PlanNum:    0,
-		}
-
-		// Find replicas that need to be migrated
-		for _, mr := range mp.Replicas {
-			mn, err := c.metaNode(mr.Addr)
-			if err != nil {
-				log.LogErrorf("Failed to get meta node(%s), err: %s", mr.Addr, err.Error())
-				continue
-			}
-
-			storeMode, err := c.getMetaPartitionStoreMode(mp, mr.Addr)
-			if err != nil {
-				log.LogErrorf("Failed to get meta replica store mode, err: %s", err.Error())
-				continue
-			}
-			memorySize := GetMetaPartitionMemorySize(mp)
-			// Record original replica info
-			mrRec := &proto.MrBalanceInfo{
-				Source:       mr.Addr,
-				SrcMemSize:   memorySize,
-				SrcNodeSetId: mn.NodeSetID,
-				SrcZoneName:  mn.ZoneName,
-				Status:       PlanTaskInit,
-				StoreMode:    storeMode,
-			}
-			mpPlan.Original = append(mpPlan.Original, mrRec)
-
-			if count >= plan.ModeCnt {
-				continue
-			}
-			// Skip replicas that are already in target mode
-			if mr.StoreMode == plan.Mode {
-				continue
-			}
-
-			// Create migration plan for this replica
-			migratePlan := &proto.MrBalanceInfo{
-				Source:       mr.Addr,
-				SrcMemSize:   memorySize,
-				SrcNodeSetId: mn.NodeSetID,
-				SrcZoneName:  mn.ZoneName,
-				Status:       PlanTaskInit,
-				StoreMode:    storeMode,
-			}
-			mpPlan.OverLoad = append(mpPlan.OverLoad, migratePlan)
-			mpPlan.PlanNum++
-			count++
-		}
-
-		if mpPlan.PlanNum > 0 {
-			plan.Plan = append(plan.Plan, mpPlan)
-			plan.Total++
-		}
-		if plan.Total >= MaxMpMigrateNum {
-			break
-		}
-	}
-
-	return nil
-}
-
 func IsRocksdbDiskUsageLow(metaNode *MetaNode) bool {
 	for _, rocksdbDisk := range metaNode.RocksdbDisks {
 		if rocksdbDisk.UsageRatio < gConfig.metaNodeMemLowPer {
@@ -2212,16 +2166,6 @@ func CheckStoreModeIsRocksdb(migratePlan *proto.ClusterPlan, mpPlan *proto.MetaB
 		}
 	}
 	return isRocksdb
-}
-
-func GetReplicasStoreModeCount(mp *MetaPartition, storeMode proto.StoreMode) int {
-	count := 0
-	for _, replica := range mp.Replicas {
-		if replica.StoreMode == storeMode {
-			count += 1
-		}
-	}
-	return count
 }
 
 func GetMetaPartitionMemorySize(mp *MetaPartition) uint64 {
@@ -2265,13 +2209,11 @@ func (c *Cluster) doMetaPartitionMigrate(plan *proto.ClusterPlan, mpPlan *proto.
 			return err
 		}
 
-		if plan.Type != AddLearner {
-			// switch raft leader if the source is leader. And waiting for the leader to be elected.
-			err = c.changeAndCheckMetaPartitionLeader(mrPlan, mpPlan, mp)
-			if err != nil {
-				log.LogErrorf("changeAndCheckMetaPartitionLeader error: %s", err.Error())
-				return err
-			}
+		// switch raft leader if the source is leader. And waiting for the leader to be elected.
+		err = c.changeAndCheckMetaPartitionLeader(mrPlan, mpPlan, mp)
+		if err != nil {
+			log.LogErrorf("changeAndCheckMetaPartitionLeader error: %s", err.Error())
+			return err
 		}
 
 		if verifyDestinationInMetaReplicas(mp, mrPlan.Destination) {
@@ -2286,7 +2228,7 @@ func (c *Cluster) doMetaPartitionMigrate(plan *proto.ClusterPlan, mpPlan *proto.
 		}
 
 		if plan.Type == AddLearner {
-			err = c.addMetaReplicaLearner(mp, mrPlan.Destination, plan.Mode)
+			err = c.addMetaReplicaLearner(mp, mrPlan.Destination, plan.Mode, mrPlan.Source, !plan.AutoPromote)
 		} else {
 			err = c.migrateMetaPartition(mrPlan.Source, mrPlan.Destination, mp, mrPlan.StoreMode)
 		}
@@ -2390,7 +2332,7 @@ func (c *Cluster) AnalyzeMetaNodes(storeMode proto.StoreMode) {
 
 		nodeMemRatio = CaculateNodeMemoryRatio(metaNode)
 		if nodeMemRatio > gConfig.metaNodeMemHighPer {
-			fmt.Fprintf(&unusableBuf, "%s total: %d, used: %d, ratio: %f > %f\n", metaNode.Addr, metaNode.NodeMemTotal, metaNode.NodeMemUsed, nodeMemRatio, gConfig.metaNodeMemHighPer)
+			fmt.Fprintf(&unusableBuf, "metanode memory %s total: %d, used: %d, ratio: %f > %f\n", metaNode.Addr, metaNode.NodeMemTotal, metaNode.NodeMemUsed, nodeMemRatio, gConfig.metaNodeMemHighPer)
 			return true
 		}
 
@@ -2423,7 +2365,7 @@ func (c *Cluster) AnalyzeMetaNodes(storeMode proto.StoreMode) {
 			return true
 		}
 		if metaNode.systemMemoryReachesThreshold() {
-			fmt.Fprintf(&unusableBuf, "%s total(%v) used(%v) threshold(%v)\n", metaNode.Addr, metaNode.NodeMemUsed, metaNode.NodeMemTotal, metaNode.Threshold)
+			fmt.Fprintf(&unusableBuf, "system memory %s total(%v) used(%v) threshold(%v)\n", metaNode.Addr, metaNode.NodeMemUsed, metaNode.NodeMemTotal, metaNode.Threshold)
 			return true
 		}
 
@@ -2434,7 +2376,7 @@ func (c *Cluster) AnalyzeMetaNodes(storeMode proto.StoreMode) {
 				return true
 			}
 			if metaNode.reachesRocksdbDisksThreshold() {
-				fmt.Fprintf(&unusableBuf, "%s total(%v) used(%v) threshold(%v)\n", metaNode.Addr, metaNode.GetRocksdbTotal(), metaNode.GetRocksdbUsed(), metaNode.RocksdbDiskThreshold)
+				fmt.Fprintf(&unusableBuf, "rocksdb disk %s total(%v) used(%v) threshold(%v)\n", metaNode.Addr, metaNode.GetRocksdbTotal(), metaNode.GetRocksdbUsed(), metaNode.RocksdbDiskThreshold)
 				return true
 			}
 			if !metaNode.rocksdbDiskKeyNumUnderMax() {
@@ -2445,8 +2387,8 @@ func (c *Cluster) AnalyzeMetaNodes(storeMode proto.StoreMode) {
 				fmt.Fprintf(&unusableBuf, "\n")
 				return true
 			}
-			if !metaNode.RocksdbRdOnly {
-				fmt.Fprintf(&unusableBuf, "%s RocksdbRdOnly is false\n", metaNode.Addr)
+			if metaNode.RocksdbRdOnly {
+				fmt.Fprintf(&unusableBuf, "%s RocksdbRdOnly is true\n", metaNode.Addr)
 				return true
 			}
 			if !IsRocksdbDiskUsageLow(metaNode) {
@@ -2464,7 +2406,7 @@ func (c *Cluster) AnalyzeMetaNodes(storeMode proto.StoreMode) {
 				return true
 			}
 			if metaNode.reachesThreshold() {
-				fmt.Fprintf(&unusableBuf, "%s total(%v) used(%v) threshold(%v)\n", metaNode.Addr, metaNode.Total, metaNode.Used, metaNode.Threshold)
+				fmt.Fprintf(&unusableBuf, "metanode memory %s total(%v) used(%v) threshold(%v)\n", metaNode.Addr, metaNode.Total, metaNode.Used, metaNode.Threshold)
 				return true
 			}
 			if metaNode.RdOnly {
@@ -2489,41 +2431,11 @@ func (c *Cluster) AnalyzeMetaNodes(storeMode proto.StoreMode) {
 	log.LogWarnf(usableBuf.String())
 }
 
-func TrimMigrateMetaPartitionPlan(migratePlan *proto.ClusterPlan) {
-	if migratePlan == nil || migratePlan.Type != ModifyStore {
-		return
-	}
-
-	for _, mpPlan := range migratePlan.Plan {
-		if len(mpPlan.OverLoad) >= len(mpPlan.Plan) {
-			continue
-		}
-		TrimMetaReplicaPlan(mpPlan)
-	}
-}
-
-func TrimMetaReplicaPlan(mpPlan *proto.MetaBalancePlan) {
-	newPlan := make([]*proto.MrBalanceInfo, 0, len(mpPlan.OverLoad))
-	for _, mr := range mpPlan.Plan {
-		for _, item := range mpPlan.OverLoad {
-			if mr.Source == item.Source {
-				newPlan = append(newPlan, mr)
-				break
-			}
-		}
-	}
-
-	mpPlan.Plan = newPlan
-}
-
 func TryNodeSetIdFromOtherNodes(migratePlan *proto.ClusterPlan, mpPlan *proto.MetaBalancePlan, getParm *GetMigrateAddrParam) error {
-	nodeSetId := make([]uint64, 0, len(mpPlan.Original))
+	nodeSetList := make([]uint64, 0, len(mpPlan.Original))
 	zoneList := make([]string, 0, len(mpPlan.Original))
 	bFind := false
 	for _, mr := range mpPlan.Original {
-		if mr.StoreMode != migratePlan.Mode {
-			continue
-		}
 		bFind = false
 		for _, item := range mpPlan.OverLoad {
 			if item.Source == mr.Source {
@@ -2534,7 +2446,7 @@ func TryNodeSetIdFromOtherNodes(migratePlan *proto.ClusterPlan, mpPlan *proto.Me
 		if bFind {
 			continue
 		}
-		for _, id := range nodeSetId {
+		for _, id := range nodeSetList {
 			if id == mr.SrcNodeSetId {
 				bFind = true
 				break
@@ -2543,17 +2455,31 @@ func TryNodeSetIdFromOtherNodes(migratePlan *proto.ClusterPlan, mpPlan *proto.Me
 		if bFind {
 			continue
 		}
-		nodeSetId = append(nodeSetId, mr.SrcNodeSetId)
+		nodeSetList = append(nodeSetList, mr.SrcNodeSetId)
 		zoneList = append(zoneList, mr.SrcZoneName)
 	}
-	if len(nodeSetId) == 0 {
+	if len(nodeSetList) == 0 {
 		return fmt.Errorf("no node set id found")
 	}
 
-	for i, nodeSetId := range nodeSetId {
-		getParm.NodeSetID = nodeSetId
-		getParm.ZoneName = zoneList[i]
-		find, dests := GetMigrateDestAddr(getParm)
+	for i, nodeSetId := range nodeSetList {
+		// clone param to avoid side effects from GetMigrateDestAddr (it will append Excludes/ExcludeRacks)
+		excludes := append([]string(nil), getParm.Excludes...)
+		excludeRacks := append([]string(nil), getParm.ExcludeRacks...)
+		curParam := &GetMigrateAddrParam{
+			Topo:         getParm.Topo,
+			RocksdbTopo:  getParm.RocksdbTopo,
+			ZoneName:     zoneList[i],
+			NodeSetID:    nodeSetId,
+			Excludes:     excludes,
+			ExcludeRacks: excludeRacks,
+			RequestNum:   getParm.RequestNum,
+			LeastSize:    getParm.LeastSize,
+			IsRocksdb:    getParm.IsRocksdb,
+			RackLevel:    getParm.RackLevel,
+		}
+
+		find, dests := GetMigrateDestAddr(curParam)
 		if find {
 			if migratePlan.Type == AddLearner {
 				mpPlan.Plan = dests
@@ -2614,92 +2540,151 @@ func DisplayPlanFailedDetails(getParam *GetMigrateAddrParam, mpPlan *proto.MetaB
 	log.LogWarnf(output.String())
 }
 
-// PromoteLearnerByRange promotes all RocksDB-mode replicas that are learners to voters within [startID, endID].
+// CreatePromoteLearnerPlan promotes all RocksDB-mode replicas that are learners to voters within [startID, endID].
 // If volName is empty, it scans all volumes; otherwise, only the specified volume.
-func (c *Cluster) PromoteLearnerByRange(volName string, startID, endID uint64) (int, error) {
-	var (
-		mps      map[uint64]*MetaPartition
-		promoted int
-		err      error
-	)
-	if volName != "" {
-		vol, err := c.getVol(volName)
+func (c *Cluster) CreatePromoteLearnerPlan(param *MetaPartitionPlanUserParams) (*proto.PromoteLearnerPlan, error) {
+	var mps map[uint64]*MetaPartition
+
+	promotePlan := &proto.PromoteLearnerPlan{
+		Name:       param.Name,
+		StartID:    param.StartID,
+		EndID:      param.EndID,
+		Mode:       param.Mode,
+		SelectType: param.SelectType,
+		ZoneName:   param.ZoneName,
+		NodeSetID:  param.NodeSetID,
+		SelectTag:  param.SelectTag,
+		UndoNum:    0,
+		RunningNum: 0,
+		DoneNum:    0,
+		FailedNum:  0,
+		Progress:   0,
+		Status:     PlanTaskRun,
+	}
+
+	if param.Name != "" {
+		vol, err := c.getVol(param.Name)
 		if err != nil {
-			return promoted, fmt.Errorf("get volume(%s) failed: %v", volName, err)
+			return nil, fmt.Errorf("get volume(%s) failed: %v", param.Name, err)
 		}
 		if vol.isUnavailable() {
-			return promoted, fmt.Errorf("volume(%s) is marked delete or init failed", volName)
+			return nil, fmt.Errorf("volume(%s) is marked delete or init failed", param.Name)
 		}
 		mps = vol.cloneMetaPartitionMap()
 	} else {
 		mps = c.getAllMetaPartitions()
 	}
 
+	count := 0
+	for _, mp := range mps {
+		if param.StartID != 0 && mp.PartitionID < param.StartID {
+			continue
+		}
+		if param.EndID != 0 && mp.PartitionID > param.EndID {
+			continue
+		}
+		for _, peer := range mp.Peers {
+			if peer.Type == raftProto.PeerLearner {
+				count++
+				break
+			}
+		}
+		if count >= MaxMpMigrateNum {
+			break
+		}
+	}
+	promotePlan.Learners = make([]*proto.MetaPartitionLearnerInfo, 0, count)
+
 	for _, mp := range mps {
 		// filter by id range
-		if startID != 0 && mp.PartitionID < startID {
+		if param.StartID != 0 && mp.PartitionID < param.StartID {
 			continue
 		}
-		if endID != 0 && mp.PartitionID > endID {
+		if param.EndID != 0 && mp.PartitionID > param.EndID {
 			continue
 		}
+
 		// scan replicas and promote rocksdb replicas
+		learnerInfo := &proto.MetaPartitionLearnerInfo{
+			ID:         mp.PartitionID,
+			Learners:   make([]string, 0, len(mp.Peers)),
+			DeleteAddr: make([]string, 0, len(mp.Peers)),
+		}
 		for _, peer := range mp.Peers {
 			if peer.Type != raftProto.PeerLearner {
 				continue
 			}
-			if err = c.promoteMetaReplicaToVoter(mp, peer.Addr); err != nil {
-				log.LogErrorf("[PromoteLearnerByRange] promote learner failed mp(%d) addr(%s): %v", mp.PartitionID, peer.Addr, err)
-				return promoted, err
-			}
-
-			err = c.RemoveRedundantMetaReplica(mp, peer.Addr)
-			if err != nil {
-				log.LogErrorf("[PromoteLearnerByRange] remove redundant meta replica failed mp(%d) addr(%s): %v", mp.PartitionID, peer.Addr, err)
-				return promoted, err
-			}
-
-			promoted++
+			learnerInfo.Learners = append(learnerInfo.Learners, peer.Addr)
+		}
+		if len(learnerInfo.Learners) > 0 {
+			promotePlan.Learners = append(promotePlan.Learners, learnerInfo)
 		}
 	}
-	return promoted, nil
+
+	promotePlan.StartTime = time.Now()
+	promotePlan.UndoNum = int32(count)
+	promotePlan.TotalNum = int32(count)
+
+	err := c.syncAddPromoteLearnerPlan(promotePlan)
+	if err != nil {
+		log.LogErrorf("syncAddPromoteLearnerPlan error: %s", err.Error())
+		return nil, err
+	}
+
+	c.SetClusterPlanRunning()
+	go c.DoPromoteLearnerPlan(promotePlan)
+
+	return promotePlan, nil
 }
 
-func (c *Cluster) CreateMetaPartitionAddLearnerPlan(volName string, startID, endID uint64) (*proto.ClusterPlan, error) {
+func (c *Cluster) CreateMetaPartitionAddLearnerPlan(param *MetaPartitionPlanUserParams) (*proto.ClusterPlan, error) {
 	// Create a new meta partition migrate plan
 	plan := &proto.ClusterPlan{
 		Low:            make(map[string]*proto.ZonePressureView),
 		RocksdbLow:     make(map[string]*proto.ZonePressureView),
 		Plan:           make([]*proto.MetaBalancePlan, 0),
-		Status:         PlanTaskInit,
+		Status:         PlanTaskRun,
 		Type:           AddLearner,
-		Mode:           proto.StoreModeRocksDb,
-		ModeCnt:        0,
-		StartId:        startID,
-		EndId:          endID,
+		Mode:           param.Mode,
+		ModeCnt:        param.Count,
+		StartId:        param.StartID,
+		EndId:          param.EndID,
 		RackLevel:      c.getRackAwareLevel(),
 		FailedList:     make([]uint64, 0),
 		DoneNum:        0,
 		RunningNum:     0,
 		DoneReplicaNum: 0,
 		RunReplicaNum:  0,
+		AutoPromote:    param.AutoPromoteLearner,
+		SelectType:     param.SelectType,
+		ZoneName:       param.ZoneName,
+		NodeSetID:      param.NodeSetID,
+		SelectTag:      param.SelectTag,
 	}
 
 	err := c.GetLowMemPressureTopology(plan)
 	if err != nil {
-		log.LogErrorf("GetLowMemPressureTopology error: %s", err.Error())
+		log.LogErrorf("GetLowMemPressureTopology error name(%s) start(%d) end(%d) mode(%d) cnt(%d): %s",
+			param.Name, param.StartID, param.EndID, param.Mode, param.Count, err.Error())
 		return plan, err
 	}
 
-	err = c.FillAddLearnerPlan(plan, volName)
+	err = c.FillAddLearnerPlan(plan, param.Name)
 	if err != nil {
-		log.LogErrorf("FillAddLearnerPlan error: %s", err.Error())
+		log.LogErrorf("FillAddLearnerPlan error name(%s) start(%d) end(%d) mode(%d) cnt(%d): %s",
+			param.Name, param.StartID, param.EndID, param.Mode, param.Count, err.Error())
 		return plan, err
 	}
 
-	err = c.FindAddLearnerDestination(plan)
+	if len(plan.Plan) == 0 {
+		log.LogWarnf("no replicas need to be migrated in volume(%s)", param.Name)
+		return nil, fmt.Errorf("no replicas need to be migrated in volume(%s)", param.Name)
+	}
+
+	err = c.FindAddLearnerDestination(plan, param)
 	if err != nil {
-		log.LogErrorf("FindAddLearnerDestination error: %s", err.Error())
+		log.LogWarnf("FindAddLearnerDestination error name(%s) start(%d) end(%d) mode(%d) cnt(%d): %s",
+			param.Name, param.StartID, param.EndID, param.Mode, param.Count, err.Error())
 		return plan, err
 	}
 
@@ -2709,10 +2694,7 @@ func (c *Cluster) CreateMetaPartitionAddLearnerPlan(volName string, startID, end
 		plan.TotalReplicaNum += len(item.Plan)
 	}
 	plan.UndoReplicaNum = int32(plan.TotalReplicaNum)
-
-	if plan.Total <= 0 {
-		return nil, fmt.Errorf("no replicas need to be migrated in volume(%s)", volName)
-	}
+	plan.StartTime = time.Now()
 
 	// Save plan into raft storage
 	err = c.syncAddBalanceTask(plan)
@@ -2720,6 +2702,9 @@ func (c *Cluster) CreateMetaPartitionAddLearnerPlan(volName string, startID, end
 		log.LogErrorf("syncAddBalanceTask err: %s", err.Error())
 		return nil, err
 	}
+
+	c.SetClusterPlanRunning()
+	go c.DoMetaPartitionBalanceTask(plan)
 
 	return plan, nil
 }
@@ -2736,9 +2721,17 @@ func (c *Cluster) FillAddLearnerPlan(plan *proto.ClusterPlan, volName string) er
 			return fmt.Errorf("volume(%s) is marked delete or init failed", volName)
 		}
 
+		if vol.DefaultStoreMode != plan.Mode {
+			plan.Msg = fmt.Sprintf("volume(%s) default store mode(%d) is not equal to plan mode(%d)", volName, vol.DefaultStoreMode, plan.Mode)
+		}
+
 		mps = vol.cloneMetaPartitionMap()
 	} else {
 		mps = c.getAllMetaPartitions()
+	}
+
+	if plan.Plan == nil {
+		plan.Plan = make([]*proto.MetaBalancePlan, 0, len(mps))
 	}
 
 	for _, mp := range mps {
@@ -2749,12 +2742,13 @@ func (c *Cluster) FillAddLearnerPlan(plan *proto.ClusterPlan, volName string) er
 		if plan.EndId != 0 && mp.PartitionID > plan.EndId {
 			continue
 		}
-		count := GetMetaReplicaCountByType(mp, raftProto.PeerLearner)
-		if count >= MaxLearnerNum {
+		count := GetMetaPartitionReadyReplicaCount(plan, mp)
+		if count >= plan.ModeCnt {
 			continue
 		}
-		count = GetMetaReplicaCountByStoreMode(mp, proto.StoreModeRocksDb)
-		if count >= int(mp.ReplicaNum) || len(mp.Replicas) <= count {
+		learnerCount := GetMetaPartitionLearnerCount(mp)
+		if learnerCount >= plan.ModeCnt {
+			log.LogWarnf("mp(%d) already has (%d) learners modeCount(%d), skip", mp.PartitionID, learnerCount, plan.ModeCnt)
 			continue
 		}
 
@@ -2767,20 +2761,21 @@ func (c *Cluster) FillAddLearnerPlan(plan *proto.ClusterPlan, volName string) er
 			PlanNum:    0,
 		}
 
+		memorySize := GetMetaPartitionMemorySize(mp)
 		// Find replicas that need to be migrated
 		for _, mr := range mp.Replicas {
 			mn, err := c.metaNode(mr.Addr)
 			if err != nil {
-				log.LogErrorf("Failed to get meta node(%s), err: %s", mr.Addr, err.Error())
+				log.LogErrorf("Failed to get meta node(%s) for mp(%d), err: %s", mr.Addr, mp.PartitionID, err.Error())
 				continue
 			}
 
 			storeMode, err := c.getMetaPartitionStoreMode(mp, mr.Addr)
 			if err != nil {
-				log.LogErrorf("Failed to get meta replica store mode, err: %s", err.Error())
+				log.LogErrorf("Failed to get meta replica store mode mp(%d) addr(%s), err: %s", mp.PartitionID, mr.Addr, err.Error())
 				continue
 			}
-			memorySize := GetMetaPartitionMemorySize(mp)
+
 			// Record original replica info
 			mrRec := &proto.MrBalanceInfo{
 				Source:       mr.Addr,
@@ -2793,6 +2788,11 @@ func (c *Cluster) FillAddLearnerPlan(plan *proto.ClusterPlan, volName string) er
 			mpPlan.Original = append(mpPlan.Original, mrRec)
 		}
 
+		// skip empty plan if all replicas were filtered out due to errors
+		if len(mpPlan.Original) == 0 {
+			continue
+		}
+
 		plan.Plan = append(plan.Plan, mpPlan)
 		plan.Total++
 		if plan.Total >= MaxMpMigrateNum {
@@ -2803,20 +2803,28 @@ func (c *Cluster) FillAddLearnerPlan(plan *proto.ClusterPlan, volName string) er
 	return nil
 }
 
-func (c *Cluster) FindAddLearnerDestination(migratePlan *proto.ClusterPlan) (err error) {
-	for i, mp := range migratePlan.Plan {
-		err = AddOneLearnerToDestination(migratePlan, mp)
+func (c *Cluster) FindAddLearnerDestination(migratePlan *proto.ClusterPlan, param *MetaPartitionPlanUserParams) (err error) {
+	for i, mpPlan := range migratePlan.Plan {
+		err = c.AddLearnerToDestination(migratePlan, mpPlan, param)
 		if err == NotEnoughResource {
 			log.LogWarnf("Analyze the meta nodes:")
 			c.AnalyzeMetaNodes(migratePlan.Mode)
 
 			if i <= 0 {
-				migratePlan.Msg = fmt.Sprintf("require to migrate (%d) mp, but not create plan", len(migratePlan.Plan))
-				log.LogErrorf(migratePlan.Msg)
+				if migratePlan.Msg == "" {
+					migratePlan.Msg = fmt.Sprintf("require to migrate (%d) mp, but not create plan", len(migratePlan.Plan))
+				} else {
+					migratePlan.Msg = fmt.Sprintf("%s, require to migrate (%d) mp, but not create plan", migratePlan.Msg, len(migratePlan.Plan))
+				}
+				log.LogWarnf(migratePlan.Msg)
 				return
 			}
 
-			migratePlan.Msg = fmt.Sprintf("require to migrate (%d) mp, only create (%d) plan", len(migratePlan.Plan), i)
+			if migratePlan.Msg == "" {
+				migratePlan.Msg = fmt.Sprintf("require to migrate (%d) mp, only create (%d) plan", len(migratePlan.Plan), i)
+			} else {
+				migratePlan.Msg = fmt.Sprintf("%s, require to migrate (%d) mp, only create (%d) plan", migratePlan.Msg, len(migratePlan.Plan), i)
+			}
 			migratePlan.Plan = migratePlan.Plan[:i]
 			log.LogWarnf(migratePlan.Msg)
 			return nil
@@ -2829,156 +2837,881 @@ func (c *Cluster) FindAddLearnerDestination(migratePlan *proto.ClusterPlan) (err
 	return nil
 }
 
-func AddOneLearnerToDestination(migratePlan *proto.ClusterPlan, mpPlan *proto.MetaBalancePlan) error {
+func (c *Cluster) AddLearnerToDestination(migratePlan *proto.ClusterPlan, mpPlan *proto.MetaBalancePlan, param *MetaPartitionPlanUserParams) error {
 	if len(mpPlan.Original) == 0 {
 		return fmt.Errorf("no original replicas")
 	}
 
-	zone, nodeSetID, err := GetMemoryStoreZoneAndNodeSet(mpPlan)
+	mp, err := c.getMetaPartitionByID(mpPlan.ID)
 	if err != nil {
-		log.LogErrorf("AddOneLearnerToDestination failed: %s", err.Error())
+		log.LogErrorf("getMetaPartitionByID error: %s", err.Error())
 		return err
+	}
+
+	count := GetMetaPartitionReadyReplicaCount(migratePlan, mp)
+	if count >= migratePlan.ModeCnt {
+		log.LogWarnf("mp(%d) already has (%d) ready replicas, no need to fill learner plan", mpPlan.ID, count)
+		return fmt.Errorf("mp(%d) already has (%d) ready replicas, no need to fill learner plan", mpPlan.ID, count)
+	}
+	count = migratePlan.ModeCnt - count
+
+	learnerCount := GetMetaPartitionLearnerCount(mp)
+	if (count + learnerCount) > proto.MaxMetaPartitionLearnerNum {
+		count = proto.MaxMetaPartitionLearnerNum - learnerCount
+		mpPlan.Msg = fmt.Sprintf("mp(%d) already has (%d) learners, only add (%d) learners", mpPlan.ID, learnerCount, count)
+		log.LogWarnf(mpPlan.Msg)
+	}
+
+	if count <= 0 {
+		log.LogInfof("mp(%d) no need to add learners, count: %d", mpPlan.ID, count)
+		return nil
 	}
 
 	getParam := &GetMigrateAddrParam{
 		Topo:        migratePlan.Low,
 		RocksdbTopo: migratePlan.RocksdbLow,
-		ZoneName:    zone,
-		NodeSetID:   nodeSetID,
-		Excludes:    make([]string, 0),
-		RequestNum:  MaxLearnerNum,
-		LeastSize:   MetaPartitionMemMin,
-		IsRocksdb:   true,
+		ZoneName:    migratePlan.ZoneName,
+		NodeSetID:   migratePlan.NodeSetID,
+		RequestNum:  count,
+		LeastSize:   mpPlan.Original[0].SrcMemSize,
+		IsRocksdb:   migratePlan.Mode == proto.StoreModeRocksDb,
 		RackLevel:   migratePlan.RackLevel,
 	}
 	FillExcludeAddrIntoGetParam(mpPlan, getParam)
 
-	// try to find resource from the mp member which has the same store mode.
-	err = TryNodeSetIdFromOtherNodes(migratePlan, mpPlan, getParam)
-	if err == nil {
-		log.LogWarnf("TryNodeSetIdFromOtherNodes success")
-		return nil
-	}
-
 	// try to find resource from the same node set.
 	find, dests := GetMigrateDestAddr(getParam)
 	if find {
-		mpPlan.Plan = dests
+		err := c.FillLearnerPlanDestination(migratePlan, mpPlan, dests, param, mp)
+		if err != nil {
+			log.LogErrorf("FillLearnerPlanDestination error: %s", err.Error())
+			return err
+		}
 		return nil
 	}
 
 	// try the others node set under the same zone.
+	FillExcludeAddrIntoGetParam(mpPlan, getParam)
 	find, dests = GetMigrateAddrExcludeNodeSet(getParam)
 	if !find {
 		// try to find resource from other zone.
+		FillExcludeAddrIntoGetParam(mpPlan, getParam)
 		find, dests = GetMigrateAddrExcludeZone(getParam)
 	}
 	if !find {
-		log.LogWarnf("Display the failed details:")
-		DisplayPlanFailedDetails(getParam, mpPlan, migratePlan, true)
+		log.LogWarnf("Display the failed details: mp(%d) need(%d)", mpPlan.ID, migratePlan.ModeCnt)
+		DisplayPlanFailedDetails(getParam, mpPlan, migratePlan, migratePlan.Mode == proto.StoreModeRocksDb)
 		return NotEnoughResource
 	}
 
-	mpPlan.Plan = dests
-
-	return nil
-}
-
-func (c *Cluster) RemoveRedundantMetaReplica(mp *MetaPartition, excludeAddr string) error {
-	count := GetMetaReplicaCountByType(mp, raftProto.PeerNormal)
-	if count <= int(mp.ReplicaNum) {
-		return nil
-	}
-
-	srcAddr, err := SelectOneMemoryStoreModeReplica(mp, excludeAddr)
+	err = c.FillLearnerPlanDestination(migratePlan, mpPlan, dests, param, mp)
 	if err != nil {
-		log.LogErrorf("[RemoveRedundantMetaReplica] mp[%v] select one memory store mode replica failed, err: %s", mp.PartitionID, err.Error())
+		log.LogErrorf("FillLearnerPlanDestination error: %s", err.Error())
 		return err
 	}
 
-	if err = c.deleteMetaReplica(mp, srcAddr, false, false); err != nil {
-		log.LogErrorf("[RemoveRedundantMetaReplica] mp[%v] addr[%v] delete meta replica failed, err: %s", mp.PartitionID, srcAddr, err.Error())
-		return err
-	}
-
-	mp.IsRecover = true
-	c.putBadMetaPartitions(srcAddr, mp.PartitionID)
-
-	mp.RLock()
-	c.syncUpdateMetaPartition(mp)
-	mp.RUnlock()
 	return nil
 }
 
-func SelectOneMemoryStoreModeReplica(mp *MetaPartition, excludeAddr string) (string, error) {
-	excludeAddrs := make([]string, 0, 2)
-	excludeAddrs = append(excludeAddrs, excludeAddr)
-
-	oldLeaderAddr := ""
-	for _, mr := range mp.Replicas {
-		if mr.IsLeader {
-			oldLeaderAddr = mr.Addr
-			break
-		}
-	}
-	excludeAddrs = append(excludeAddrs, oldLeaderAddr)
-
-	// select one replica that is not leader and not in excludeAddr
-	srcAddr := SelectMetaPartitionReplica(mp, excludeAddrs)
-	if srcAddr != "" {
-		return srcAddr, nil
-	}
-
-	excludeAddrs[1] = ""
-	srcAddr = SelectMetaPartitionReplica(mp, excludeAddrs)
-	if srcAddr == "" {
-		err := fmt.Errorf("no replica found after changing leader")
-		log.LogErrorf("[SelectOneMemoryStoreModeReplica] %s", err.Error())
-		return "", err
-	}
-	return srcAddr, nil
-}
-
-func SelectMetaPartitionReplica(mp *MetaPartition, excludeAddrs []string) string {
-	srcAddr := ""
+func SelectOneReplicaStrickly(mp *MetaPartition, excludeAddrs []string, param *MetaPartitionPlanUserParams) string {
 	for _, mr := range mp.Replicas {
 		if contains(excludeAddrs, mr.Addr) {
 			continue
 		}
-		if mr.StoreMode == proto.StoreModeRocksDb {
+		switch param.SelectType {
+		case SelectTypeZoneName:
+			if mr.metaNode.ZoneName != param.ZoneName {
+				return mr.Addr
+			}
+		case SelectTypeNodeSetId:
+			if mr.metaNode.NodeSetID != param.NodeSetID {
+				return mr.Addr
+			}
+		case SelectTypeNodeAddrs:
+			if mr.metaNode.SelectTag != param.SelectTag {
+				return mr.Addr
+			}
+		default:
+			if mr.StoreMode != param.Mode {
+				return mr.Addr
+			}
+		}
+	}
+	return ""
+}
+
+func SelectOneReplicaToDelete(mp *MetaPartition, excludeAddrs []string, param *MetaPartitionPlanUserParams) string {
+	addr := SelectOneReplicaStrickly(mp, excludeAddrs, param)
+	if addr != "" {
+		return addr
+	}
+
+	for _, mr := range mp.Replicas {
+		if contains(excludeAddrs, mr.Addr) {
 			continue
 		}
-		srcAddr = mr.Addr
-		break
+		return mr.Addr
 	}
-	return srcAddr
+	return ""
 }
 
-func GetMetaReplicaCountByStoreMode(mp *MetaPartition, storeMode proto.StoreMode) int {
+func (c *Cluster) CreateAndRunCheckSumPlan(param *MetaPartitionPlanUserParams) (*proto.MetaPartitionsChecksumPlan, error) {
+	plan, err := c.CreateCheckSumPlan(param)
+	if err != nil {
+		log.LogErrorf("CreateCheckSumPlan failed: %s", err.Error())
+		return nil, err
+	}
+
+	if c.IsClusterPlanNotIdle() {
+		return plan, nil
+	}
+
+	c.SetClusterPlanRunning()
+	go c.DoMetaPartitionCheckSumTask(plan)
+
+	return plan, nil
+}
+
+func (c *Cluster) CreateCheckSumPlan(param *MetaPartitionPlanUserParams) (*proto.MetaPartitionsChecksumPlan, error) {
+	var mps map[uint64]*MetaPartition
+	if param.Name != "" {
+		vol, err := c.getVol(param.Name)
+		if err != nil {
+			log.LogErrorf("CreateCheckSumPlan get volume(%s) failed: %v", param.Name, err)
+			return nil, fmt.Errorf("get volume(%s) failed: %v", param.Name, err)
+		}
+		if vol.isUnavailable() {
+			log.LogErrorf("CreateCheckSumPlan volume(%s) is marked delete or init failed", param.Name)
+			return nil, fmt.Errorf("volume(%s) is marked delete or init failed", param.Name)
+		}
+		mps = vol.cloneMetaPartitionMap()
+	} else {
+		mps = c.getAllMetaPartitions()
+	}
+
 	count := 0
-	for _, mr := range mp.Replicas {
-		if mr.StoreMode == storeMode {
-			count += 1
+	for _, mp := range mps {
+		if param.StartID != 0 && mp.PartitionID < param.StartID {
+			continue
 		}
+		if param.EndID != 0 && mp.PartitionID > param.EndID {
+			continue
+		}
+		count += 1
 	}
-	return count
+	if count == 0 {
+		return nil, fmt.Errorf("no meta partitions in range start(%d) end(%d) volume(%s)", param.StartID, param.EndID, param.Name)
+	}
+
+	plan := &proto.MetaPartitionsChecksumPlan{
+		Status:       PlanTaskRun,
+		StartTime:    time.Now(),
+		FailedList:   make([]uint64, 0),
+		CheckSumList: make([]*proto.MetaPartitionChecksumInfo, 0, count),
+		Total:        int32(count),
+		Undo:         int32(count),
+	}
+
+	for _, mp := range mps {
+		if param.StartID != 0 && mp.PartitionID < param.StartID {
+			continue
+		}
+		if param.EndID != 0 && mp.PartitionID > param.EndID {
+			continue
+		}
+		checksumInfo := &proto.MetaPartitionChecksumInfo{
+			PartitionID: mp.PartitionID,
+			Status:      PlanTaskInit,
+			Replicas:    make([]*proto.MetaReplicaChecksumInfo, 0, len(mp.Replicas)),
+		}
+		for _, mr := range mp.Replicas {
+			checksumInfo.Replicas = append(checksumInfo.Replicas, &proto.MetaReplicaChecksumInfo{
+				Addr: mr.Addr,
+			})
+		}
+		plan.CheckSumList = append(plan.CheckSumList, checksumInfo)
+	}
+
+	err := c.syncAddCheckSumPlan(plan)
+	if err != nil {
+		log.LogErrorf("syncAddCheckSumPlan failed: %s", err.Error())
+		return nil, err
+	}
+
+	return plan, nil
 }
 
-func GetMemoryStoreZoneAndNodeSet(mpPlan *proto.MetaBalancePlan) (string, uint64, error) {
-	for _, mr := range mpPlan.Original {
-		if mr.StoreMode == proto.StoreModeMem || mr.StoreMode == proto.StoreModeDef {
-			return mr.SrcZoneName, mr.SrcNodeSetId, nil
-		}
+func (c *Cluster) RestartMetaPartitionCheckSumTask() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.IsClusterPlanNotIdle() {
+		return nil
 	}
-	return "", 0, fmt.Errorf("no memory store mode replica found")
+
+	// Get the planed check sum task.
+	plan, err := c.loadCheckSumPlan()
+	if err != nil && err != proto.ErrNoCheckSumPlan {
+		log.LogErrorf("loadCheckSumPlan failed: %s", err.Error())
+		return err
+	} else if plan != nil && plan.Status == PlanTaskDone {
+		now := time.Now()
+		if plan.Expire.Before(now) {
+			err = c.syncDeleteCheckSumPlan()
+			if err != nil {
+				log.LogErrorf("syncDeleteCheckSumPlan err: %s", err.Error())
+			}
+		}
+		return nil
+	}
+
+	if plan == nil {
+		return nil
+	}
+
+	if plan.Status != PlanTaskRun {
+		// No start the plan task if the status is not running.
+		return nil
+	}
+
+	c.SetClusterPlanRunning()
+	go c.DoMetaPartitionCheckSumTask(plan)
+
+	return nil
 }
 
-func GetMetaReplicaCountByType(mp *MetaPartition, raftType raftProto.PeerType) int {
+func (c *Cluster) DoMetaPartitionCheckSumTask(plan *proto.MetaPartitionsChecksumPlan) {
+	defer func() {
+		// clear the run flag.
+		c.SetClusterPlanIdle()
+	}()
+
+	if plan.Total <= 0 {
+		plan.Status = PlanTaskDone
+		plan.Msg = "No meta partitions to check"
+		plan.EndTime = time.Now()
+		plan.Expire = time.Now().Add(defaultPlanExpireHours * time.Hour)
+		err := c.syncUpdateCheckSumPlan(plan)
+		if err != nil {
+			log.LogErrorf("syncUpdateCheckSumPlan err: %s", err.Error())
+			plan.Msg = err.Error()
+		}
+		return
+	}
+
+	concurrency := gConfig.mpMigrateThreads
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var planMutex sync.Mutex
+
+	plan.StartTime = time.Now()
+
+	for _, checksumInfo := range plan.CheckSumList {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(info *proto.MetaPartitionChecksumInfo) {
+			defer wg.Done()
+			atomic.AddInt32(&plan.Undo, -1)
+			atomic.AddInt32(&plan.Running, 1)
+			err := c.StartTodoMetaPartitionCheckSum(plan, info)
+			done := atomic.AddInt32(&plan.Done, 1)
+			atomic.AddInt32(&plan.Running, -1)
+			planMutex.Lock()
+			if err != nil {
+				log.LogErrorf("StartTodoMetaPartitionCheckSum err: %s", err.Error())
+				plan.FailedList = append(plan.FailedList, info.PartitionID)
+			}
+			plan.Progress = float64(done) / float64(plan.Total) * 100
+			err = c.syncUpdateCheckSumPlan(plan)
+			if err != nil {
+				log.LogErrorf("syncUpdateCheckSumPlan err: %s", err.Error())
+				plan.Msg = err.Error()
+			}
+			planMutex.Unlock()
+			<-sem
+		}(checksumInfo)
+	}
+	wg.Wait()
+
+	if c.IsClusterPlanStopping() {
+		plan.Status = PlanTaskStop
+		plan.Msg = "check sum plan is stopped"
+	} else {
+		if len(plan.FailedList) > 0 {
+			plan.Status = PlanTaskError
+			plan.Msg = "Please check the detail in each msg."
+		} else {
+			plan.Status = PlanTaskDone
+		}
+	}
+	plan.EndTime = time.Now()
+	plan.Expire = time.Now().Add(defaultPlanExpireHours * time.Hour)
+
+	err := c.syncUpdateCheckSumPlan(plan)
+	if err != nil {
+		log.LogErrorf("syncUpdateCheckSumPlan err: %s", err.Error())
+		plan.Msg = err.Error()
+	}
+}
+
+func (c *Cluster) StartTodoMetaPartitionCheckSum(plan *proto.MetaPartitionsChecksumPlan, checksumInfo *proto.MetaPartitionChecksumInfo) error {
+	checksumInfo.StartTime = time.Now()
+	checksumInfo.Status = PlanTaskRun
+
+	err := c.syncUpdateCheckSumPlan(plan)
+	if err != nil {
+		log.LogErrorf("syncUpdateCheckSumPlan err: %s", err.Error())
+		return err
+	}
+
+	err = c.DoMetaPartitionCheckSum(checksumInfo)
+	if err != nil {
+		log.LogErrorf("DoMetaPartitionCheckSum err: %s", err.Error())
+		checksumInfo.Status = PlanTaskError
+		checksumInfo.Msg = err.Error()
+		return err
+	}
+
+	checksumInfo.Status = PlanTaskDone
+
+	return nil
+}
+
+func (c *Cluster) DoMetaPartitionCheckSum(checksumInfo *proto.MetaPartitionChecksumInfo) error {
+	if c.IsClusterPlanNotRun() {
+		return ErrClusterPlanNotRunning
+	}
+
+	mp, err := c.getMetaPartitionByID(checksumInfo.PartitionID)
+	if err != nil {
+		log.LogErrorf("getMetaPartitionByID err: %s", err.Error())
+		return err
+	}
+	if len(mp.LoadResponse) > 0 {
+		checksumInfo.LastApplyID = mp.LoadResponse[0].Md5ApplyId
+	}
+	err = c.startMetaPartitionCheckSum(mp)
+	if err != nil {
+		log.LogErrorf("startMetaPartitionCheckSum err: %s", err.Error())
+		return err
+	}
+
+	err = c.WaitForMetaPartitionCheckSumResult(mp, checksumInfo)
+	if err != nil {
+		log.LogErrorf("waitForMetaPartitionCheckSumResult err: %s", err.Error())
+		return err
+	}
+
+	return nil
+}
+
+func (c *Cluster) startMetaPartitionCheckSum(partition *MetaPartition) (err error) {
+	var (
+		candidateAddrs []string
+		leaderAddr     string
+	)
+	log.LogWarnf("action[startMetaPartitionCheckSum] start,vol[%v],meta partition[%v],hosts[%v]",
+		partition.volName, partition.PartitionID, partition.Hosts)
+
+	candidateAddrs = make([]string, 0, len(partition.Hosts))
+	leaderMr, err := partition.getMetaReplicaLeader()
+	if err == nil {
+		leaderAddr = leaderMr.Addr
+		if contains(partition.Hosts, leaderAddr) {
+			candidateAddrs = append(candidateAddrs, leaderAddr)
+			log.LogWarnf("action[startMetaPartitionCheckSum] found leader,vol[%v],meta partition[%v],leader[%v]",
+				partition.volName, partition.PartitionID, leaderAddr)
+		} else {
+			leaderAddr = ""
+			log.LogWarnf("action[startMetaPartitionCheckSum] leader not in hosts,vol[%v],meta partition[%v],leader[%v],hosts[%v]",
+				partition.volName, partition.PartitionID, leaderMr.Addr, partition.Hosts)
+		}
+	} else {
+		log.LogWarnf("action[startMetaPartitionCheckSum] getLeader failed,vol[%v],meta partition[%v],err[%v]",
+			partition.volName, partition.PartitionID, err)
+	}
+	for _, host := range partition.Hosts {
+		if host == leaderAddr {
+			continue
+		}
+		candidateAddrs = append(candidateAddrs, host)
+	}
+	log.LogWarnf("action[startMetaPartitionCheckSum] candidateAddrs[%v],vol[%v],meta partition[%v]",
+		candidateAddrs, partition.volName, partition.PartitionID)
+	// send task to leader addr first,if need to retry,then send to other addr
+	for _, host := range candidateAddrs {
+		_, err = c.buildStartMetaPartitionCheckSumTaskAndSyncSend(partition, host)
+		if err == nil {
+			log.LogWarnf("action[startMetaPartitionCheckSum] success,vol[%v],meta partition[%v],leader[%v],host[%v]",
+				partition.volName, partition.PartitionID, leaderAddr, host)
+			return
+		}
+
+		log.LogWarnf("action[startMetaPartitionCheckSum] retry error,vol[%v],meta partition[%v],leader[%v],host[%v],err[%v]",
+			partition.volName, partition.PartitionID, leaderAddr, host, err)
+	}
+
+	log.LogWarnf("action[startMetaPartitionCheckSum] failed after all retries,vol[%v],meta partition[%v],err[%v]",
+		partition.volName, partition.PartitionID, err)
+	return
+}
+
+func (c *Cluster) buildStartMetaPartitionCheckSumTaskAndSyncSend(mp *MetaPartition, leaderAddr string) (resp *proto.Packet, err error) {
+	defer func() {
+		var resultCode uint8
+		if resp != nil {
+			resultCode = resp.ResultCode
+		}
+
+		if err != nil {
+			log.LogErrorf("action[buildStartMetaPartitionCheckSumTaskAndSyncSend],vol[%v],meta partition[%v],leader[%v],resultCode[%v],err[%v]",
+				mp.volName, mp.PartitionID, leaderAddr, resultCode, err)
+		} else {
+			log.LogWarnf("action[buildStartMetaPartitionCheckSumTaskAndSyncSend],vol[%v],meta partition[%v],leader[%v],resultCode[%v] success",
+				mp.volName, mp.PartitionID, leaderAddr, resultCode)
+		}
+	}()
+
+	t, err := mp.createTaskToCalculateCheckSum(leaderAddr)
+	if err != nil {
+		log.LogWarnf("action[buildStartMetaPartitionCheckSumTaskAndSyncSend] createTask failed,vol[%v],meta partition[%v],err[%v]",
+			mp.volName, mp.PartitionID, err)
+		return
+	}
+	leaderMetaNode, err := c.metaNode(leaderAddr)
+	if err != nil {
+		log.LogWarnf("action[buildStartMetaPartitionCheckSumTaskAndSyncSend] getMetaNode failed,vol[%v],meta partition[%v],leader[%v],err[%v]",
+			mp.volName, mp.PartitionID, leaderAddr, err)
+		return
+	}
+
+	if resp, err = leaderMetaNode.Sender.syncSendAdminTask(t); err != nil {
+		log.LogWarnf("action[buildStartMetaPartitionCheckSumTaskAndSyncSend] sendTask failed,vol[%v],meta partition[%v],leader[%v],err[%v]",
+			mp.volName, mp.PartitionID, leaderAddr, err)
+		return
+	}
+	return
+}
+
+func (mp *MetaPartition) createTaskToCalculateCheckSum(leaderAddr string) (t *proto.AdminTask, err error) {
+	req := &proto.CalcMetaPartitionMd5SumRequest{
+		PartitionID: mp.PartitionID,
+	}
+	t = proto.NewAdminTask(proto.OpCalcMetaPartitionMd5Sum, leaderAddr, req)
+	resetMetaPartitionTaskID(t, mp.PartitionID)
+	log.LogWarnf("action[createTaskToCalculateCheckSum] task created,vol[%v],meta partition[%v],leader[%v],taskID[%v]",
+		mp.volName, mp.PartitionID, leaderAddr, t.ID)
+	return
+}
+
+func (c *Cluster) WaitForMetaPartitionCheckSumResult(mp *MetaPartition, checksumInfo *proto.MetaPartitionChecksumInfo) error {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var err error
+	maxRetry := CalcuMetaPartitionReadyMaxRetry(mp)
+	for i := 0; i < maxRetry; i++ {
+		select {
+		case <-ticker.C:
+			if c.IsClusterPlanNotRun() {
+				return ErrClusterPlanNotRunning
+			}
+			err = c.CopyMd5SumToChecksumInfo(mp, checksumInfo)
+			if err == nil {
+				return nil
+			}
+		case <-c.stopc:
+			c.SetClusterPlanStopping()
+			return fmt.Errorf("cluster is stopping")
+		}
+	}
+	if err != nil {
+		log.LogWarnf("Check Mp[%v] Md5Sum err: %s", mp.PartitionID, err.Error())
+		return err
+	}
+
+	return fmt.Errorf("Waiting for meta partition(%d) Md5Sum retry(%d) timeout", mp.PartitionID, maxRetry)
+}
+
+func (c *Cluster) CopyMd5SumToChecksumInfo(mp *MetaPartition, checksumInfo *proto.MetaPartitionChecksumInfo) error {
+	if len(checksumInfo.Replicas) == 0 {
+		return fmt.Errorf("No replicas for mp[%v]", mp.PartitionID)
+	}
+
+	replicaByAddr := make(map[string]*proto.MetaReplicaChecksumInfo, len(checksumInfo.Replicas))
+	for _, replica := range checksumInfo.Replicas {
+		replicaByAddr[replica.Addr] = replica
+	}
+
+	count := 0
+	for _, response := range mp.LoadResponse {
+		if response.Md5Sum == "" || response.Md5ApplyId <= checksumInfo.LastApplyID {
+			continue
+		}
+		if replica := replicaByAddr[response.Addr]; replica != nil {
+			replica.Md5Sum = response.Md5Sum
+			replica.ApplyID = response.Md5ApplyId
+			count++
+		}
+	}
+
+	if count != len(checksumInfo.Replicas) {
+		return fmt.Errorf("Not receive all the Md5Sum for mp[%v]", mp.PartitionID)
+	}
+
+	firstApplyID := checksumInfo.Replicas[0].ApplyID
+	firstMd5Sum := checksumInfo.Replicas[0].Md5Sum
+	for _, replica := range checksumInfo.Replicas {
+		if replica.ApplyID != firstApplyID {
+			return fmt.Errorf("mp[%v] applyID not same, %v[%v], %v[%v]",
+				mp.PartitionID, checksumInfo.Replicas[0].Addr, firstApplyID, replica.Addr, replica.ApplyID)
+		}
+		if replica.Md5Sum != firstMd5Sum {
+			return fmt.Errorf("mp[%v] Md5Sum not same, %v[%v], %v[%v]",
+				mp.PartitionID, checksumInfo.Replicas[0].Addr, firstMd5Sum, replica.Addr, replica.Md5Sum)
+		}
+	}
+
+	rstMsg := fmt.Sprintf("mp[%v] Md5Sum check success, applyID[%v], md5Sum[%v]", mp.PartitionID, firstApplyID, firstMd5Sum)
+	auditlog.LogMasterOp("checkMetaPartitionMd5Sum", rstMsg, nil)
+
+	return nil
+}
+
+func (c *Cluster) FillLearnerPlanDestination(migratePlan *proto.ClusterPlan, mpPlan *proto.MetaBalancePlan, dest []*proto.MrBalanceInfo, param *MetaPartitionPlanUserParams, mp *MetaPartition) error {
+	if len(dest) == 0 {
+		log.LogWarnf("FillLearnerPlanDestination: no destination mp[%v]", mpPlan.ID)
+		return fmt.Errorf("no destination")
+	}
+
+	if !migratePlan.AutoPromote {
+		mpPlan.Plan = dest
+		return nil
+	}
+
+	excludeAddrs := make([]string, 0, len(dest))
+	for _, item := range dest {
+		srcAddr := SelectOneReplicaToDelete(mp, excludeAddrs, param)
+		if srcAddr == "" {
+			return fmt.Errorf("no replica found for mp[%v]", mpPlan.ID)
+		}
+		excludeAddrs = append(excludeAddrs, srcAddr)
+		item.Source = srcAddr
+		for _, original := range mpPlan.Original {
+			if original.Source == srcAddr {
+				item.SrcMemSize = original.SrcMemSize
+				item.SrcNodeSetId = original.SrcNodeSetId
+				item.SrcZoneName = original.SrcZoneName
+				item.SrcRack = original.SrcRack
+				break
+			}
+		}
+	}
+
+	mpPlan.Plan = dest
+
+	return nil
+}
+
+func GetMetaPartitionLearnerList(mp *MetaPartition) []string {
+	learnerList := make([]string, 0, len(mp.Peers))
+	for _, peer := range mp.Peers {
+		if peer.Type == raftProto.PeerLearner {
+			learnerList = append(learnerList, peer.Addr)
+		}
+	}
+	return learnerList
+}
+
+func GetMetaPartitionLearnerCount(mp *MetaPartition) int {
 	count := 0
 	for _, peer := range mp.Peers {
-		if peer.Type == raftType {
+		if peer.Type == raftProto.PeerLearner {
 			count += 1
 		}
 	}
 	return count
+}
+
+func GetMetaPartitionReadyReplicaCount(plan *proto.ClusterPlan, mp *MetaPartition) int {
+	count := 0
+	for _, mr := range mp.Replicas {
+		switch plan.SelectType {
+		case SelectTypeZoneName:
+			if mr.metaNode.ZoneName == plan.ZoneName {
+				count += 1
+			}
+		case SelectTypeNodeSetId:
+			if mr.metaNode.NodeSetID == plan.NodeSetID {
+				count += 1
+			}
+		case SelectTypeNodeAddrs:
+			if mr.metaNode.SelectTag == plan.SelectTag {
+				count += 1
+			}
+		default:
+			if mr.StoreMode == plan.Mode {
+				count += 1
+			}
+		}
+	}
+	return count
+}
+
+func (c *Cluster) tryToChangeMetaPartitionLeader(mp *MetaPartition, oldLeader string) error {
+	var newLeader string
+	for _, replica := range mp.Replicas {
+		// Learner cannot be leader, skip it
+		if replica.Addr != oldLeader && !replica.IsLearner {
+			newLeader = replica.Addr
+			break
+		}
+	}
+
+	if newLeader == "" {
+		return fmt.Errorf("no new leader found for mp[%v]", mp.PartitionID)
+	}
+
+	for i := 0; i < CheckMetaLeaderRetry; i++ {
+		err := mp.tryToChangeLeaderByHost(newLeader)
+		if err != nil {
+			log.LogErrorf("metapartition[%d] try to change leader to host[%s] failed, err[%s]",
+				mp.PartitionID, newLeader, err.Error())
+		}
+
+		leader, err := mp.getMetaReplicaLeader()
+		if err != nil {
+			log.LogWarnf("metapartition[%d] has no leader", mp.PartitionID)
+			time.Sleep(CheckMetaLeaderInterval * time.Second)
+			continue
+		}
+		if leader.Addr != oldLeader {
+			// the leader is not the source node, the meta partition can be migrated.
+			return nil
+		}
+
+		time.Sleep(CheckMetaLeaderInterval * time.Second)
+	}
+
+	return fmt.Errorf("Try to change mp[%v] leader from %s to %s failed", mp.PartitionID, oldLeader, newLeader)
+}
+
+func (c *Cluster) DoPromoteLearnerPlan(plan *proto.PromoteLearnerPlan) error {
+	defer c.SetClusterPlanIdle()
+
+	concurrency := gConfig.mpMigrateThreads
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var (
+		wg     sync.WaitGroup
+		planMu sync.Mutex
+	)
+
+	var stopProcess uint32
+	atomic.StoreUint32(&stopProcess, 0)
+
+	for _, learnerInfo := range plan.Learners {
+		if atomic.LoadUint32(&stopProcess) != 0 {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+
+		planMu.Lock()
+		plan.RunningNum++
+		plan.UndoNum--
+		planMu.Unlock()
+
+		go func(info *proto.MetaPartitionLearnerInfo) {
+			defer wg.Done()
+
+			err := c.PromoteMetaReplicaAndWait(plan, info)
+			<-sem
+			planMu.Lock()
+			if err != nil {
+				log.LogErrorf("DoPromoteLearnerPlan PromoteMetaReplicaAndWait error: %s", err.Error())
+				atomic.StoreUint32(&stopProcess, 1)
+				plan.FailedNum++
+				plan.FailedList = append(plan.FailedList, info.ID)
+				plan.Msg = err.Error()
+			}
+			plan.RunningNum--
+			plan.DoneNum++
+			plan.Progress = float64(plan.DoneNum) / float64(plan.TotalNum) * 100
+			planMu.Unlock()
+		}(learnerInfo)
+
+		planMu.Lock()
+		err := c.syncUpdatePromoteLearnerPlan(plan)
+		planMu.Unlock()
+		if err != nil {
+			log.LogErrorf("syncUpdatePromoteLearnerPlan error: %s", err.Error())
+		}
+	}
+	wg.Wait()
+
+	if c.IsClusterPlanStopping() {
+		plan.Status = PlanTaskStop
+		plan.Msg = "promote learner plan is stopped"
+	} else {
+		if atomic.LoadUint32(&stopProcess) != 0 {
+			plan.Status = PlanTaskError
+		} else {
+			plan.Status = PlanTaskDone
+		}
+	}
+	plan.EndTime = time.Now()
+	plan.Expire = time.Now().Add(defaultPlanExpireHours * time.Hour)
+	err := c.syncUpdatePromoteLearnerPlan(plan)
+	if err != nil {
+		log.LogErrorf("syncUpdatePromoteLearnerPlan error: %s", err.Error())
+		return err
+	}
+
+	return nil
+}
+
+func (c *Cluster) PromoteMetaReplicaAndWait(plan *proto.PromoteLearnerPlan, learnerInfo *proto.MetaPartitionLearnerInfo) error {
+	mp, err := c.getMetaPartitionByID(learnerInfo.ID)
+	if err != nil {
+		log.LogErrorf("PromoteMetaReplicaAndWait getMetaPartition error: %s", err.Error())
+		return err
+	}
+
+	for _, learner := range learnerInfo.Learners {
+		if c.IsClusterPlanNotRun() {
+			return nil
+		}
+		if !IsMetaReplicaLearner(mp, learner) {
+			continue
+		}
+		srcAddr, err := c.TryToSelectOneReplica(mp, learnerInfo.Learners, plan)
+		if err != nil {
+			log.LogErrorf("[PromoteMetaReplicaAndWait] mp[%v] select one memory store mode replica failed, err: %s", mp.PartitionID, err.Error())
+			return err
+		}
+		learnerInfo.DeleteAddr = append(learnerInfo.DeleteAddr, srcAddr)
+
+		mp.IsRecover = true
+		mp.SrcAddr = srcAddr
+		mp.LearnerDstAddr = learner
+		mp.RecoverStartTime = time.Now().Unix()
+		mp.RecoverFailCount = 0
+		mp.RecoverState = proto.RecoverStateRecovering
+		c.putBadMetaPartitions(srcAddr, mp.PartitionID)
+
+		// wait for mp ready.
+		err = c.waitForMetaPartitionReady(mp)
+		if err != nil {
+			log.LogErrorf("waitForMetaPartitionReady error: %s", err.Error())
+			return err
+		}
+	}
+
+	return nil
+}
+
+func IsMetaReplicaLearner(mp *MetaPartition, learnerAddr string) bool {
+	for _, peer := range mp.Peers {
+		if peer.Type == raftProto.PeerLearner && peer.Addr == learnerAddr {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Cluster) TryToSelectOneReplica(mp *MetaPartition, excludeAddrs []string, plan *proto.PromoteLearnerPlan) (string, error) {
+	excludeAddrsBackup := make([]string, 0, len(excludeAddrs)+1)
+	excludeAddrsBackup = append(excludeAddrsBackup, excludeAddrs...)
+	hasLeader := false
+	leaderAddr := ""
+	for _, mr := range mp.Replicas {
+		if mr.IsLeader {
+			excludeAddrsBackup = append(excludeAddrsBackup, mr.Addr)
+			hasLeader = true
+			leaderAddr = mr.Addr
+			break
+		}
+	}
+	param := &MetaPartitionPlanUserParams{
+		SelectType: plan.SelectType,
+		ZoneName:   plan.ZoneName,
+		NodeSetID:  plan.NodeSetID,
+		SelectTag:  plan.SelectTag,
+		Mode:       plan.Mode,
+	}
+
+	// select one replica that is not leader and not in excludeAddr
+	srcAddr := SelectOneReplicaStrickly(mp, excludeAddrsBackup, param)
+	if srcAddr != "" {
+		return srcAddr, nil
+	}
+
+	if !hasLeader {
+		err := fmt.Errorf("can not select one replica to be removed")
+		log.LogErrorf("[TryToSelectOneReplica] %s", err.Error())
+		return "", err
+	}
+
+	srcAddr = SelectOneReplicaToDelete(mp, excludeAddrs, param)
+	if srcAddr == "" {
+		err := fmt.Errorf("no replica found after changing leader")
+		log.LogErrorf("[TryToSelectOneReplica] %s", err.Error())
+		return "", err
+	}
+
+	if srcAddr == leaderAddr {
+		err := c.tryToChangeMetaPartitionLeader(mp, srcAddr)
+		if err != nil {
+			log.LogErrorf("tryToChangeMetaPartitionLeader error: %s", err.Error())
+			return "", err
+		}
+	}
+
+	return srcAddr, nil
+}
+
+func (c *Cluster) RestartPromoteLearnerPlan() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.IsClusterPlanNotIdle() {
+		return nil
+	}
+
+	// Get the planed promote learner plan.
+	plan, err := c.loadPromoteLearnerPlan()
+	if err != nil {
+		if err == proto.ErrNoPromoteLearnerPlan {
+			return nil
+		}
+		log.LogErrorf("loadPromoteLearnerPlan err: %s", err.Error())
+		return err
+	}
+
+	if plan.Status == PlanTaskDone {
+		now := time.Now()
+		if plan.Expire.Before(now) {
+			err = c.syncDeletePromoteLearnerPlan()
+			if err != nil {
+				log.LogErrorf("syncDeletePromoteLearnerPlan err: %s", err.Error())
+			}
+		}
+		return nil
+	}
+
+	if plan.Status != PlanTaskRun {
+		// No start the plan task if the status is not running.
+		return nil
+	}
+
+	c.SetClusterPlanRunning()
+	go c.DoPromoteLearnerPlan(plan)
+
+	return nil
 }

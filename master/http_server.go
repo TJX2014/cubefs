@@ -407,6 +407,18 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
 		Path(proto.AdminGetUpgradeCompatibleSettings).
 		HandlerFunc(m.getUpgradeCompatibleSettings)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminExecuteDistributionOptimizationMigrations).
+		HandlerFunc(m.executeDistributionOptimizationMigrations)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminCancelDpDistributionOptimization).
+		HandlerFunc(m.cancelDpDistributionOptimization)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminQueryDistributionOptimizationStatus).
+		HandlerFunc(m.queryDistributionOptimizationStatus)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminSetDistributionOptimizationEnable).
+		HandlerFunc(m.setDistributionOptimizationEnable)
 
 	// volume management APIs
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
@@ -611,11 +623,20 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.DeleteMetaNodeBalanceTask).
 		HandlerFunc(m.deleteMetaNodeBalancePlan)
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
-		Path(proto.AdminBatchAddMpLearner).
-		HandlerFunc(m.batchAddMpLearner)
+		Path(proto.AdminBatchMigrateMp).
+		HandlerFunc(m.batchMigrateMetaPartition)
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
 		Path(proto.AdminBatchPromoteMpLearner).
 		HandlerFunc(m.batchPromoteMpLearner)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminGetPromoteMpLearnerPlan).
+		HandlerFunc(m.getPromoteMpLearnerPlan)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminCalcMetaPartitionMd5Sum).
+		HandlerFunc(m.calcMetaPartitionMd5Sum)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminGetMd5SumResult).
+		HandlerFunc(m.getMd5SumResult)
 
 	// data partition management APIs
 	router.NewRoute().Methods(http.MethodGet).
@@ -651,6 +672,9 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 	router.NewRoute().Methods(http.MethodGet).
 		Path(proto.AdminQueryDataPartitionDecommissionStatusUpdateRecords).
 		HandlerFunc(m.queryDataPartitionDecommissionStatusUpdateRecords)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.AdminQueryDpDecommissionStatus).
+		HandlerFunc(m.queryDecommissionStatus)
 	router.NewRoute().Methods(http.MethodGet).
 		Path(proto.AdminCheckReplicaMeta).
 		HandlerFunc(m.checkReplicaMeta)

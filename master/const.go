@@ -86,6 +86,7 @@ const (
 	rdOnlyKey                              = "rdOnly"
 	srcAddrKey                             = "srcAddr"
 	targetAddrKey                          = "targetAddr"
+	manualPromoteKey                       = "manualPromote"
 	forceKey                               = "force"
 	raftForceDelKey                        = "raftForceDel"
 	weightKey                              = "weight"
@@ -138,12 +139,14 @@ const (
 	autoDecommissionDiskIntervalKey        = "autoDecommissionDiskInterval"
 	autoDpMetaRepairKey                    = "autoDpMetaRepair"
 	autoDpMetaRepairParallelCntKey         = "autoDpMetaRepairParallelCnt"
+	enableMpDecommissionByLearnerKey       = "enableMpDecommissionByLearner"
 	autoDistributionOptimizationKey        = "autoDistributionOptimization"
 	distributionOptimizationConDpCntKey    = "distributionOptimizationConDpCnt"
 	distributionOptimizationThresholdKey   = "distributionOptimizationThreshold"
 	dpTimeoutKey                           = "dpTimeout"
 	mpTimeoutKey                           = "mpTimeout"
 	rackAwareLevelKey                      = "rackAware"
+	learnerRecoverTimeoutSecondsKey        = "learnerRecoverTimeoutSeconds"
 	ShowAll                                = "showAll"
 	trashIntervalKey                       = "trashInterval"
 	accessTimeIntervalKey                  = "accessTimeValidInterval"
@@ -159,6 +162,10 @@ const (
 	quotaClass                             = "quotaClass"
 	quotaOfClass                           = "quotaOfStorageClass"
 	dataMediaTypeKey                       = "dataMediaType"
+	dpLimitSsdBaseCountKey                 = "dpLimitSsdBaseCount"
+	dpLimitSsdFactorKey                    = "dpLimitSsdFactor"
+	dpLimitHddBaseCountKey                 = "dpLimitHddBaseCount"
+	dpLimitHddFactorKey                    = "dpLimitHddFactor"
 
 	remoteCacheEnable            = "remoteCacheEnable"
 	remoteCacheAutoPrepare       = "remoteCacheAutoPrepare"
@@ -172,9 +179,12 @@ const (
 	remoteCacheSameZoneTimeout   = "remoteCacheSameZoneTimeout"
 	remoteCacheSameRegionTimeout = "remoteCacheSameRegionTimeout"
 
-	StoreModeKey = "storeMode"
-	StartIdKey   = "start"
-	EndIdKey     = "end"
+	StoreModeKey  = "storeMode"
+	StartIdKey    = "start"
+	EndIdKey      = "end"
+	PromoteKey    = "promote"
+	SelectTypeKey = "selectType"
+	SelectTagKey  = "selectTag"
 )
 
 const (
@@ -233,6 +243,7 @@ const (
 	retrySendSyncTaskInternal                         = 3 * time.Second
 	defaultRangeOfCountDifferencesAllowed             = 50
 	defaultMinusOfMaxInodeID                          = 1000
+	defaultMinusOfCommit                              = 1000
 	defaultNodeSetGrpBatchCnt                         = 3
 	defaultMaxReplicaCnt                              = 16
 	defaultIopsRLimit                          uint64 = 1 << 35
@@ -271,6 +282,11 @@ const (
 
 	maxTrashInterval     = 365 * 24 * 60
 	mpReplicaDelInterval = 300 // 5 minutes
+
+	// Learner mode recovery constants
+	defaultLearnerRecoverTimeout = 3600 // 1 hour
+	learnerRecoverRetryInterval  = 120  // 2 minutes
+	learnerRecoverMaxFailCount   = 5    // maximum failure count
 
 	defaultRocksdbDiskThreshold float32 = 0.6
 )
@@ -370,6 +386,12 @@ const (
 
 	opSyncAddFlashManualTask    uint32 = 0x72
 	opSyncDeleteFlashManualTask uint32 = 0x73
+
+	opSyncAddCheckSumPlan    uint32 = 0x74
+	opSyncUpdateCheckSumPlan uint32 = 0x75
+
+	opSyncAddPromoteLearnerPlan    uint32 = 0x76
+	opSyncUpdatePromoteLearnerPlan uint32 = 0x77
 )
 
 func init() {
@@ -508,7 +530,9 @@ const (
 	flashGroupPrefix      = keySeparator + "fg" + keySeparator
 	flashManualTaskPrefix = keySeparator + "flt" + keySeparator
 
-	balanceTaskKey = keySeparator + "balanceTask"
+	balanceTaskKey        = keySeparator + "balanceTask"
+	checkSumPlanKey       = keySeparator + "checkSumPlan"
+	promoteLearnerPlanKey = keySeparator + "promoteLearnerPlan"
 )
 
 // selector enum
@@ -562,4 +586,9 @@ const (
 	PlanStatusIdle     = 0
 	PlanStatusRun      = 1
 	PlanStatusStopping = 2
+
+	SelectTypeNotSet    = 0
+	SelectTypeZoneName  = 1
+	SelectTypeNodeSetId = 2
+	SelectTypeNodeAddrs = 3
 )
