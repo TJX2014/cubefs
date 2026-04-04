@@ -48,6 +48,8 @@ const (
 	ConfAddNode    ConfChangeType = 0
 	ConfRemoveNode ConfChangeType = 1
 	ConfUpdateNode ConfChangeType = 2
+	ConfAddLearner ConfChangeType = 3
+	ConfPromoteLearner ConfChangeType = 4
 
 	EntryNormal     EntryType = 0
 	EntryConfChange EntryType = 1
@@ -185,6 +187,10 @@ func (t ConfChangeType) String() string {
 		return "ConfRemoveNode"
 	case 2:
 		return "ConfUpdateNode"
+	case 3:
+		return "ConfAddLearner"
+	case 4:
+		return "ConfPromoteLearner"
 	}
 	return "unknown"
 }
