@@ -47,6 +47,12 @@ const (
 	DefaultMaxBackgroundFlushes     = 16
 	DefaultSoftCompactionLimit      = 512 * util.GB
 	DefaultHardCompactionLimit      = 2 * util.TB
+	ReadTierAll                     = 0
+	ReadTierBlockCache              = 1
+	ReadTierPersisted               = 2
+	ReadTierMemtable                = 3
+	FlushInterval                   = 3 * time.Second
+	TryFlushNum                     = 100
 )
 
 var (
@@ -55,6 +61,7 @@ var (
 	ErrInvalidRocksdbWriteHandle = errors.New("invalid rocksdb write batch")
 	ErrInvalidRocksdbTableType   = errors.New("invalid rocksdb table type")
 	ErrInvalidRocksdbSnapshot    = errors.New("invalid rocksdb snapshot")
+	ErrDoingFlush                = errors.New("doing flush")
 )
 
 type TableType byte
@@ -131,13 +138,18 @@ type RocksdbOperator struct {
 	openOption  *gorocksdb.Options
 	cache       *gorocksdb.Cache
 	tableOption *gorocksdb.BlockBasedTableOptions
+	readDiskOption *gorocksdb.ReadOptions
 	config      map[string]string
+
+	isFlushing bool
+	flushMutex sync.Mutex
 }
 
 func NewRocksdb() (operator *RocksdbOperator) {
 	operator = &RocksdbOperator{
-		state:  dbInitSt,
-		config: make(map[string]string),
+		state:      dbInitSt,
+		config:     make(map[string]string),
+		isFlushing: false,
 	}
 	return
 }
@@ -163,6 +175,7 @@ func (db *RocksdbOperator) CloseDb() (err error) {
 	db.openOption.Destroy()
 	db.cache.Destroy()
 	db.tableOption.Destroy()
+	db.readDiskOption.Destroy()
 
 	db.db = nil
 	db.readOption = nil
@@ -170,6 +183,7 @@ func (db *RocksdbOperator) CloseDb() (err error) {
 	db.openOption = nil
 	db.tableOption = nil
 	db.cache = nil
+	db.readDiskOption = nil
 	return
 }
 
@@ -301,6 +315,9 @@ func (dbInfo *RocksdbOperator) doOpen(opts *RocksDBOptions) (err error) {
 	dbInfo.writeOption = gorocksdb.NewDefaultWriteOptions()
 	// NOTE: we use raft wal, enable rocksdb wal is unnecessary
 	dbInfo.writeOption.DisableWAL(true)
+	dbInfo.readDiskOption = gorocksdb.NewDefaultReadOptions()
+	dbInfo.readDiskOption.SetReadTier(ReadTierPersisted)
+	dbInfo.readDiskOption.SetFillCache(false)
 	if opts.PeriodicCompactSec > 0 {
 		err = dbInfo.db.SetOptions([]string{"periodic_compaction_seconds"}, []string{strconv.FormatInt(opts.PeriodicCompactSec, 10)})
 		if err != nil {
@@ -961,16 +978,58 @@ func (dbInfo *RocksdbOperator) CompactRange(start, end []byte) (err error) {
 	return
 }
 
-func (dbInfo *RocksdbOperator) Flush() (err error) {
+func (dbInfo *RocksdbOperator) Flush(block bool) (err error) {
+	if atomic.LoadUint32(&dbInfo.state) != dbOpenedSt {
+		log.LogErrorf("[RocksDB Op] can not access db, db is not opened. Cur state:%v", dbInfo.state)
+		return ErrRocksdbAccess
+	}
+
+	dbInfo.flushMutex.Lock()
+	if dbInfo.isFlushing {
+		dbInfo.flushMutex.Unlock()
+		return ErrDoingFlush
+	}
+	dbInfo.isFlushing = true
+	dbInfo.flushMutex.Unlock()
+
+	opts := gorocksdb.NewDefaultFlushOptions()
+	opts.SetWait(block)
+	defer func() {
+		opts.Destroy()
+		dbInfo.flushMutex.Lock()
+		dbInfo.isFlushing = false
+		dbInfo.flushMutex.Unlock()
+	}()
+	err = dbInfo.db.Flush(opts)
+	return
+}
+
+func (dbInfo *RocksdbOperator) GetBytesFromDisk(key []byte) (bytes []byte, err error) {
+	defer func() {
+		if err != nil {
+			log.LogErrorf("[RocksDB Op] GetBytesFromDisk failed, error:%v", err)
+		}
+	}()
+
 	if err = dbInfo.accessDb(); err != nil {
 		return
 	}
 	defer dbInfo.releaseDb()
 
-	opts := gorocksdb.NewDefaultFlushOptions()
-	defer opts.Destroy()
-	opts.SetWait(true)
-
-	err = dbInfo.db.Flush(opts)
+	for index := 0; index < DefaultRetryCount; {
+		bytes, err = dbInfo.db.GetBytes(dbInfo.readDiskOption, key)
+		if err == nil {
+			break
+		}
+		if !isRetryError(err) {
+			log.LogErrorf("[RocksDB Op] GetBytesFromDisk failed, error(%v)", err)
+			break
+		}
+		log.LogErrorf("[RocksDB Op] GetBytesFromDisk failed with retry error(%v), continue", err)
+		index++
+	}
+	if err != nil {
+		err = ErrRocksdbOperation
+	}
 	return
 }

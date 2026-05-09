@@ -110,7 +110,8 @@ type Snapshot interface {
 type Tree interface {
 	SetApplyID(index uint64)
 	GetApplyID() uint64
-	Flush() error
+	Flush(block bool) error
+	GetApplyIdFromDisk() (uint64, error)
 	Execute(fn func(tree interface{}) interface{}) interface{}
 	CreateBatchWriteHandle() (interface{}, error)
 	CommitBatchWrite(handle interface{}, needCommitApplyID bool) error

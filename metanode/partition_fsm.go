@@ -271,6 +271,7 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 		}
 		msg := &storeMsg{
 			command:      opFSMStoreTick,
+			applyIndex:   index,
 			snap:         snap,
 			quotaRebuild: quotaRebuild,
 			uidRebuild:   uidRebuild,
@@ -794,6 +795,11 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				log.LogErrorf("[ApplySnapshot] mp(%v) failed to write mp metadata", mp.config.PartitionId)
 				return
 			}
+			err = mp.flushAndCheckApplyID(appIndexID)
+			if err != nil {
+				log.LogErrorf("[ApplySnapshot] mp(%v) flush and check apply id failed, err(%v)", mp.config.PartitionId, err)
+				return
+			}
 			err = mp.inodeTree.ClearBatchWriteHandle(dbWriteHandle)
 			if err != nil {
 				log.LogErrorf("[ApplySnapshot] mp(%v) failed to clear handle", mp.config.PartitionId)
@@ -808,6 +814,7 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 			}
 			mp.storeChan <- &storeMsg{
 				command:      opFSMStoreTick,
+				applyIndex:   appIndexID,
 				uniqId:       mp.GetUniqId(),
 				uniqChecker:  uniqChecker.clone(),
 				multiVerList: mp.GetVerList(),
@@ -1108,6 +1115,36 @@ func (mp *metaPartition) uploadApplyID(applyId uint64) {
 
 func (mp *metaPartition) getApplyID() (applyId uint64) {
 	return atomic.LoadUint64(&mp.applyID)
+}
+
+func (mp *metaPartition) flushAndCheckApplyID(appIndexID uint64) (err error) {
+	if mp.HasMemStore() {
+		return nil
+	}
+
+	var diskApplyID uint64
+	for i := 0; i < TryFlushNum; i++ {
+		err = mp.inodeTree.Flush(true)
+		if err == nil {
+			return nil
+		}
+		if err != ErrDoingFlush {
+			log.LogErrorf("[flushAndCheckApplyID] mp(%v) flush err: %s", mp.config.PartitionId, err.Error())
+			return err
+		}
+
+		diskApplyID, err = mp.inodeTree.GetApplyIdFromDisk()
+		if err != nil {
+			log.LogErrorf("[flushAndCheckApplyID] mp(%v) get apply id from disk err: %s", mp.config.PartitionId, err.Error())
+			return err
+		}
+		if diskApplyID >= appIndexID {
+			return nil
+		}
+		time.Sleep(FlushInterval)
+	}
+
+	return fmt.Errorf("[flushAndCheckApplyID] mp(%v) timeout, appIndexID: %d, diskApplyID: %d", mp.config.PartitionId, appIndexID, diskApplyID)
 }
 
 func (mp *metaPartition) getCommittedID() (committedId uint64) {

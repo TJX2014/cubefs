@@ -423,9 +423,25 @@ func (r *RocksTree) GetCursor() uint64 {
 	return atomic.LoadUint64(&r.baseInfo.cursor)
 }
 
-// NOTE: we disable WAL, flush operation write all data to sst files
-func (r *RocksTree) Flush() error {
-	return r.db.Flush()
+// NOTE: we disable WAL, flush operation writes data to sst files.
+func (r *RocksTree) Flush(block bool) error {
+	return r.db.Flush(block)
+}
+
+func (r *RocksTree) GetApplyIdFromDisk() (uint64, error) {
+	baseInfoBytes, err := r.db.GetBytesFromDisk(r.warpKey(baseInfoKey))
+	if err != nil {
+		return 0, err
+	}
+	if len(baseInfoBytes) == 0 {
+		return 0, nil
+	}
+
+	var baseInfo RocksBaseInfo
+	if err = baseInfo.Unmarshal(baseInfoBytes); err != nil {
+		return 0, err
+	}
+	return baseInfo.applyId, nil
 }
 
 func (r *RocksTree) Count(tp TreeType) (uint64, error) {

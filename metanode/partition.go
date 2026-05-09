@@ -1295,17 +1295,17 @@ func (mp *metaPartition) doFileStats(thresholds []uint64) {
 }
 
 func (mp *metaPartition) store(sm *storeMsg) (err error) {
+	applyIndex := sm.ApplyIndex()
 	if mp.HasRocksDBStore() {
-		mp.storedApplyId = sm.snap.ApplyID()
 		log.LogInfof("[store] mp(%v) flush rocksdb memory table to sst", mp.config.PartitionId)
-		// NOTE: execute flush
-		if err = mp.inodeTree.Flush(); err != nil {
+		if err = mp.inodeTree.Flush(true); err != nil {
 			return
 		}
+		mp.storedApplyId = applyIndex
 		return nil
 	}
 	log.LogDebugf("[store] mp(%v) store snapshot", mp.config.PartitionId)
-	log.LogWarnf("metaPartition %d store apply %v", mp.config.PartitionId, sm.snap.ApplyID())
+	log.LogWarnf("metaPartition %d store apply %v", mp.config.PartitionId, applyIndex)
 	tmpDir := path.Join(mp.config.RootDir, snapshotDirTmp)
 	if _, err = os.Stat(tmpDir); err == nil {
 		// TODO Unhandled errors
@@ -1343,7 +1343,7 @@ func (mp *metaPartition) store(sm *storeMsg) (err error) {
 		}
 		crcBuffer.WriteString(fmt.Sprintf("%d", crc))
 	}
-	log.LogWarnf("metaPartition %d store apply %v", mp.config.PartitionId, sm.snap.ApplyID())
+	log.LogWarnf("metaPartition %d store apply %v", mp.config.PartitionId, applyIndex)
 	if err = mp.storeApplyID(tmpDir, sm); err != nil {
 		return
 	}
@@ -1385,7 +1385,7 @@ func (mp *metaPartition) store(sm *storeMsg) (err error) {
 		return
 	}
 
-	mp.storedApplyId = sm.snap.ApplyID()
+	mp.storedApplyId = applyIndex
 	return
 }
 
@@ -1538,7 +1538,7 @@ func (mp *metaPartition) Reset() (err error) {
 		}
 	}
 	mp.txProcessor.Reset()
-	err = mp.inodeTree.Flush()
+	err = mp.inodeTree.Flush(true)
 	if err != nil {
 		log.LogErrorf("[Reset] mp(%v) failed to clear data, err(%v)", mp.config.PartitionId, err)
 		err = nil
@@ -2266,7 +2266,7 @@ func (mp *metaPartition) Clear() (err error) {
 	if err != nil {
 		return
 	}
-	err = mp.inodeTree.Flush()
+	err = mp.inodeTree.Flush(true)
 	if err != nil {
 		return
 	}

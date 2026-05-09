@@ -28,12 +28,26 @@ import (
 
 type storeMsg struct {
 	command      uint32
+	applyIndex   uint64
 	snap         Snapshot
 	quotaRebuild bool
 	uidRebuild   bool
 	uniqId       uint64
 	uniqChecker  *uniqChecker
 	multiVerList []*proto.VolVersionInfo
+}
+
+func (sm *storeMsg) ApplyIndex() uint64 {
+	if sm == nil {
+		return 0
+	}
+	if sm.applyIndex != 0 {
+		return sm.applyIndex
+	}
+	if sm.snap != nil {
+		return sm.snap.ApplyID()
+	}
+	return 0
 }
 
 func (mp *metaPartition) startSchedule(curIndex uint64) {
@@ -43,22 +57,23 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 	scheduleState := common.StateStopped
 	lastCursor := mp.GetCursor()
 	dumpFunc := func(msg *storeMsg) {
+		applyIndex := msg.ApplyIndex()
 		log.LogWarnf("[startSchedule] partitionId=%d: nowAppID"+
 			"=%d, applyID=%d", mp.config.PartitionId, curIndex,
-			msg.snap.ApplyID())
+			applyIndex)
 		if err := mp.store(msg); err == nil {
 			// truncate raft log
-			if mp.raftPartition != nil {
+			if mp.raftPartition != nil && curIndex > 0 {
 				log.LogWarnf("[startSchedule] start trunc, partitionId=%d: nowAppID"+
 					"=%d, applyID=%d", mp.config.PartitionId, curIndex,
-					msg.snap.ApplyID())
+					applyIndex)
 				mp.raftPartition.Truncate(curIndex)
 			} else {
 				// maybe happen when start load dentry
 				log.LogWarnf("[startSchedule] raftPartition is nil so skip" +
 					" truncate raft log")
 			}
-			curIndex = msg.snap.ApplyID()
+			curIndex = applyIndex
 		} else {
 			// retry again
 			mp.storeChan <- msg
@@ -93,17 +108,18 @@ func (mp *metaPartition) startSchedule(curIndex uint64) {
 					maxMsg *storeMsg
 				)
 				for _, msg := range msgs {
-					if curIndex >= msg.snap.ApplyID() {
+					applyIndex := msg.ApplyIndex()
+					if curIndex >= applyIndex {
 						if msg.snap != nil {
 							msg.snap.Close()
 						}
 						continue
 					}
-					if maxIdx < msg.snap.ApplyID() {
+					if maxIdx < applyIndex {
 						if maxMsg != nil && maxMsg.snap != nil {
 							maxMsg.snap.Close()
 						}
-						maxIdx = msg.snap.ApplyID()
+						maxIdx = applyIndex
 						maxMsg = msg
 					} else {
 						if msg.snap != nil {

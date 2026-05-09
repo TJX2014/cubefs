@@ -1063,8 +1063,13 @@ func (i *BTree) GetCursor() uint64 {
 	return 0
 }
 
-func (i *BTree) Flush() error {
+func (i *BTree) Flush(block bool) error {
+	_ = block
 	return nil
+}
+
+func (i *BTree) GetApplyIdFromDisk() (uint64, error) {
+	return 0, nil
 }
 
 func (i *BTree) Count() uint64 {

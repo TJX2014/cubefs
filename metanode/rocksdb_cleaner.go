@@ -415,7 +415,7 @@ func (c *RocksDBCleaner) DoCleanRocksdbData(record *CleanRecord) error {
 }
 
 func (c *RocksDBCleaner) flushAndCheckApplyID(rocksdbTree *RocksdbTree) error {
-	err := rocksdbTree.inodeTree.Flush()
+	err := rocksdbTree.inodeTree.Flush(true)
 	if err != nil {
 		log.LogErrorf("[flushAndCheckApplyID] mp(%v) flush err: %s", rocksdbTree.PartitionId, err.Error())
 		return err
