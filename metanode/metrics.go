@@ -30,6 +30,7 @@ const (
 	MetricMetaPartitionDentryCount = "mpDentryCount"
 	MetricConnectionCount          = "connectionCnt"
 	MetricFileStats                = "fileStats"
+	RocksdbNonNvmeDisk             = "rocksdbNonNvmeDisk"
 )
 
 type MetaNodeMetrics struct {
@@ -38,6 +39,7 @@ type MetaNodeMetrics struct {
 	MetricMetaPartitionInodeCount  *exporter.GaugeVec
 	MetricMetaPartitionDentryCount *exporter.GaugeVec
 	MetricFileStats                *exporter.GaugeVec
+	RocksdbNonNvmeDisk             *exporter.GaugeVec
 
 	metricStopCh chan struct{}
 }
@@ -51,6 +53,11 @@ func (m *MetaNode) startStat() {
 		MetricMetaPartitionInodeCount:  exporter.NewGaugeVec(MetricMetaPartitionInodeCount, "", []string{"volName"}),
 		MetricMetaPartitionDentryCount: exporter.NewGaugeVec(MetricMetaPartitionDentryCount, "", []string{"volName"}),
 		MetricFileStats:                exporter.NewGaugeVec(MetricFileStats, "", []string{"volName", "sizeRange"}),
+		RocksdbNonNvmeDisk:             exporter.NewGaugeVec(RocksdbNonNvmeDisk, "", []string{"rocksdbDir"}),
+	}
+
+	for _, dbPath := range m.rocksDirs {
+		m.warnIfNotNvmeDevice(dbPath)
 	}
 
 	go m.collectPartitionMetrics()

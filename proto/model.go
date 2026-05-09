@@ -53,9 +53,15 @@ type MetaNodeInfo struct {
 	IsRocksdbWritable         bool
 	RocksdbTotal              uint64
 	RocksdbUsed               uint64
+	MemoryMpCount             uint64
+	RocksdbMpCount            uint64
 	MemorySelectCount         uint64
 	RocksdbSelectCount        uint64
 	ProfPort                  string
+	RocksdbDisks              []*MetaNodeRocksdbInfo
+	RocksdbDiskThreshold      float32
+	RocksdbRdOnly             bool
+	RocksdbKeyNumMax          uint64
 }
 
 // DataNode stores all the information about a data node
@@ -161,6 +167,8 @@ type ClusterView struct {
 	MarkDiskBrokenThreshold                   float64
 	EnableAutoDpMetaRepair                    bool
 	AutoDpMetaRepairParallelCnt               int
+	RocksdbDiskUsed                           uint64
+	RocksdbDiskAvail                          uint64
 	EnableAutoDecommission                    bool
 	AutoDecommissionDiskInterval              string
 	DecommissionFirstHostDiskParallelLimit    uint64
@@ -180,6 +188,9 @@ type ClusterView struct {
 	DataNodes                                 []NodeView
 	StatOfStorageClass                        []*StatOfStorageClass
 	StatMigrateStorageClass                   []*StatOfStorageClass
+	RocksdbDiskTotal                          uint64
+	RocksdbMpCount                            uint64
+	MemoryMpCount                             uint64
 	ForbidWriteOpOfProtoVer0                  bool
 	LegacyDataMediaType                       uint32
 	RaftPartitionCanUsingDifferentPortEnabled bool

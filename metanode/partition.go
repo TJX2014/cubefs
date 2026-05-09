@@ -1515,12 +1515,27 @@ func (mp *metaPartition) MarshalJSON() ([]byte, error) {
 
 // Reset resets the meta partition.
 func (mp *metaPartition) Reset() (err error) {
-	log.LogWarnf("[Reset] reset mp(%v)", mp.config.PartitionId)
-	// NOTE: close rocksdb
-	err = mp.Clear()
-	if err != nil {
-		log.LogErrorf("[Reset] mp(%v) failed to clear mp data", mp.config.PartitionId)
-		return
+	log.LogWarnf("[Reset] reset mp(%v) storeMode(%d)", mp.config.PartitionId, mp.config.StoreMode)
+	if mp.HasRocksDBStore() {
+		if mp.manager != nil && mp.manager.rocksdbCleaner != nil {
+			err = mp.manager.rocksdbCleaner.AddTask(mp)
+			if err != nil {
+				log.LogErrorf("[Reset] add task to cleaner failed, err: %v", err)
+				return err
+			}
+		} else {
+			err = mp.Clear()
+			if err != nil {
+				log.LogErrorf("[Reset] mp(%v) failed to clear mp data", mp.config.PartitionId)
+				return
+			}
+		}
+	} else {
+		err = mp.Clear()
+		if err != nil {
+			log.LogErrorf("[Reset] mp(%v) failed to clear mp data", mp.config.PartitionId)
+			return
+		}
 	}
 	mp.txProcessor.Reset()
 	err = mp.inodeTree.Flush()

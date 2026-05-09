@@ -423,3 +423,21 @@ func (metaNode *MetaNode) updateRocksdbDisks(resp *proto.MetaNodeHeartbeatRespon
 	defer metaNode.Unlock()
 	metaNode.RocksdbDisks = resp.RocksDBDiskInfo
 }
+
+func (metaNode *MetaNode) GetRocksdbAndMemoryCount() (rocksdbCount, memoryCount uint64) {
+	metaNode.RLock()
+	defer metaNode.RUnlock()
+
+	for _, report := range metaNode.metaPartitionInfos {
+		if report == nil {
+			continue
+		}
+		switch report.StoreMode {
+		case proto.StoreModeRocksDb:
+			rocksdbCount++
+		default:
+			memoryCount++
+		}
+	}
+	return
+}

@@ -310,6 +310,10 @@ func (m *metadataManager) opCreateMetaPartition(conn net.Conn, p *Packet,
 	}
 	log.LogWarnf("[%s] [remoteAddr=%s]accept a from"+
 		" master message: %v, reqId %v", p.String(), remoteAddr, adminTask, p.ReqID)
+	if m.rocksdbCleaner != nil && m.rocksdbCleaner.IsCleanPending(req.PartitionID) {
+		err = fmt.Errorf("partition %d is cleaning", req.PartitionID)
+		return
+	}
 	// create a new meta partition.
 	if err = m.createPartition(req); err != nil {
 		err = errors.NewErrorf("[opCreateMetaPartition]->%s; request message: %v",

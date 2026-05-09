@@ -1063,6 +1063,7 @@ func (m *Server) getCluster(w http.ResponseWriter, r *http.Request) {
 
 	cv.BadPartitionIDs = m.cluster.getBadDataPartitionsView()
 	cv.BadMetaPartitionIDs = m.cluster.getBadMetaPartitionsView()
+	m.calcClusterRocksdbInfo(cv)
 
 	sendOkReply(w, r, newSuccessHTTPReply(cv))
 }
@@ -3417,6 +3418,7 @@ func (m *Server) getVolSimpleInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	volView := newSimpleView(vol)
+	calcVolumeRocksdbInfo(vol, volView)
 
 	sendOkReply(w, r, newSuccessHTTPReply(volView))
 }
@@ -4582,6 +4584,7 @@ func (m *Server) buildNodeSetGrpInfo(nsg *nodeSetGroup) *proto.SimpleNodeSetGrpI
 			node := value.(*MetaNode)
 			nsStat.MetaTotal += node.Total
 			nsStat.MetaUsed += node.Used
+			rocksdbMpCount, memoryMpCount := node.GetRocksdbAndMemoryCount()
 			log.LogInfof("nodeset index[%v], metanode nodeset id[%v],zonename[%v], addr[%v] inner nodesetid[%v]",
 				i, nsStat.ID, node.ZoneName, node.Addr, node.NodeSetID)
 
@@ -4606,6 +4609,8 @@ func (m *Server) buildNodeSetGrpInfo(nsg *nodeSetGroup) *proto.SimpleNodeSetGrpI
 				MetaPartitionCount: node.MetaPartitionCount,
 				NodeSetID:          node.NodeSetID,
 				MaxMpCntLimit:      node.GetPartitionLimitCnt(),
+				MemoryMpCount:      memoryMpCount,
+				RocksdbMpCount:     rocksdbMpCount,
 			}
 
 			nsStat.MetaNodes = append(nsStat.MetaNodes, metaNodeInfo)
@@ -5648,6 +5653,7 @@ func (m *Server) getMetaNode(w http.ResponseWriter, r *http.Request) {
 		sendErrReply(w, r, newErrHTTPReply(proto.ErrMetaNodeNotExists))
 		return
 	}
+	rocksdbMpCount, memoryMpCount := metaNode.GetRocksdbAndMemoryCount()
 	metaNode.PersistenceMetaPartitions = m.cluster.getAllMetaPartitionIDByMetaNode(nodeAddr)
 	metaNodeInfo = &proto.MetaNodeInfo{
 		ID:                        metaNode.ID,
@@ -5673,12 +5679,72 @@ func (m *Server) getMetaNode(w http.ResponseWriter, r *http.Request) {
 		MetaPartitionCount:        metaNode.MetaPartitionCount,
 		NodeSetID:                 metaNode.NodeSetID,
 		RdOnly:                    metaNode.RdOnly,
+		RocksdbRdOnly:             metaNode.RocksdbRdOnly,
 		PersistenceMetaPartitions: metaNode.PersistenceMetaPartitions,
-		CanAllowPartition:         metaNode.IsWriteAble() && metaNode.PartitionCntLimited(),
+		CanAllowPartition:         (metaNode.IsWriteAble() || metaNode.isWritable(proto.StoreModeRocksDb)) && metaNode.PartitionCntLimited(),
 		MaxMpCntLimit:             metaNode.GetPartitionLimitCnt(),
 		CpuUtil:                   metaNode.CpuUtil.Load(),
+		MemoryMpCount:             memoryMpCount,
+		RocksdbMpCount:            rocksdbMpCount,
+		RocksdbDisks:              metaNode.RocksdbDisks,
+		RocksdbDiskThreshold:      metaNode.RocksdbDiskThreshold,
+		RocksdbKeyNumMax:          metaNode.RocksdbKeyNumMax,
 	}
 	sendOkReply(w, r, newSuccessHTTPReply(metaNodeInfo))
+}
+
+func (m *Server) calcClusterRocksdbInfo(cv *proto.ClusterView) {
+	if cv == nil || m.cluster == nil {
+		return
+	}
+
+	var (
+		rocksdbDiskUsed   uint64
+		rocksdbDiskTotal  uint64
+		rocksdbMpCountSum uint64
+		memoryMpCountSum  uint64
+	)
+
+	m.cluster.metaNodes.Range(func(addr, node interface{}) bool {
+		metaNode := node.(*MetaNode)
+		rocksdbDiskUsed += metaNode.GetRocksdbUsed()
+		rocksdbDiskTotal += metaNode.GetRocksdbTotal()
+		rocksdbMpCount, memoryMpCount := metaNode.GetRocksdbAndMemoryCount()
+		rocksdbMpCountSum += rocksdbMpCount
+		memoryMpCountSum += memoryMpCount
+		return true
+	})
+
+	cv.RocksdbDiskUsed = rocksdbDiskUsed / util.GB
+	cv.RocksdbDiskTotal = rocksdbDiskTotal / util.GB
+	cv.RocksdbMpCount = rocksdbMpCountSum
+	cv.MemoryMpCount = memoryMpCountSum
+	cv.RocksdbDiskAvail = cv.RocksdbDiskTotal - cv.RocksdbDiskUsed
+}
+
+func calcVolumeRocksdbInfo(vol *Vol, view *proto.SimpleVolView) {
+	if vol == nil || view == nil {
+		return
+	}
+
+	var (
+		rocksdbMpCount uint64
+		memoryMpCount  uint64
+	)
+
+	vol.rangeMetaPartition(func(mp *MetaPartition) bool {
+		for _, replica := range mp.Replicas {
+			if replica.StoreMode == proto.StoreModeRocksDb {
+				rocksdbMpCount++
+			} else {
+				memoryMpCount++
+			}
+		}
+		return true
+	})
+
+	view.RocksdbMpCount = rocksdbMpCount
+	view.MemoryMpCount = memoryMpCount
 }
 
 func (m *Server) setMpCntLimit(w http.ResponseWriter, r *http.Request) {

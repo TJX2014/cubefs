@@ -17,6 +17,7 @@ package metanode
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	syslog "log"
 	"net"
 	"os"
@@ -121,6 +122,7 @@ type metadataManager struct {
 
 	rocksDBDirs    []string
 	rocksdbManager RocksdbManager
+	rocksdbCleaner *RocksDBCleaner
 }
 
 func (m *metadataManager) GetAllVolumes() (volumes *util.Set) {
@@ -559,6 +561,9 @@ func (m *metadataManager) onStart() (err error) {
 	m.startSnapshotVersionPromote()
 	m.startUpdateVolumes()
 	m.startGcTimer()
+	if m.rocksdbCleaner != nil {
+		m.rocksdbCleaner.start()
+	}
 	return
 }
 
@@ -572,6 +577,9 @@ func (m *metadataManager) onStop() {
 
 	if m.gcTimer != nil {
 		m.gcTimer.Stop()
+	}
+	if m.rocksdbCleaner != nil {
+		m.rocksdbCleaner.Stop()
 	}
 }
 
@@ -717,6 +725,11 @@ func (m *metadataManager) loadPartitions() (err error) {
 			if isExpiredPartition(fileInfo.Name(), metaNodeInfo.PersistenceMetaPartitions) {
 				log.LogErrorf("loadPartitions: find expired partition[%s], rename it and you can delete it manually",
 					fileInfo.Name())
+				err = m.CheckRocksdbMetaPartition(fileInfo.Name())
+				if err != nil {
+					log.LogErrorf("CheckRocksdbMetaPartition (%s) failed, err: %v", fileInfo.Name(), err)
+					continue
+				}
 				oldName := path.Join(m.rootDir, fileInfo.Name())
 				newName := path.Join(m.rootDir, ExpiredPartitionPrefix+fileInfo.Name()+curTime)
 				os.Rename(oldName, newName)
@@ -955,6 +968,7 @@ func NewMetadataManager(conf MetadataManagerConfig, metaNode *MetaNode) Metadata
 		limitFactor:               make(map[uint32]*rate.Limiter),
 		rocksDBDirs:               metaNode.rocksDirs,
 		rocksdbManager:            metaNode.rocksdbManager,
+		rocksdbCleaner:            NewRocksDBCleaner(conf.RootDir, metaNode.rocksdbManager),
 	}
 	m.limitFactor[readDirIops] = rate.NewLimiter(rate.Limit(metaNode.readDirIops), metaNode.readDirIops/2)
 
@@ -1033,4 +1047,50 @@ func (m *metadataManager) GetMetaPartitionDir(partitionId string, storeMode prot
 	}
 
 	return metaPartitionDir
+}
+
+func (m *metadataManager) CheckRocksdbMetaPartition(fileName string) error {
+	if !strings.HasPrefix(fileName, rocksdbMpPrefix) {
+		return nil
+	}
+	if m.rocksdbCleaner == nil {
+		return nil
+	}
+
+	metaFile := path.Join(m.rootDir, fileName, metadataFile)
+	fp, err := os.OpenFile(metaFile, os.O_RDONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.LogWarnf("[CheckRocksdbMetaPartition]: metaFile %s not exist. skip check", metaFile)
+			return nil
+		}
+		return errors.NewErrorf("[CheckRocksdbMetaPartition]: OpenFile %s", err.Error())
+	}
+	defer fp.Close()
+
+	data, err := io.ReadAll(fp)
+	if err != nil || len(data) == 0 {
+		errMsg := "empty data"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		return errors.NewErrorf("[CheckRocksdbMetaPartition]: ReadFile %s, data: %s", errMsg, string(data))
+	}
+
+	mConf := &MetaPartitionConfig{}
+	if err = json.Unmarshal(data, mConf); err != nil {
+		return errors.NewErrorf("[CheckRocksdbMetaPartition]: Unmarshal MetaPartitionConfig %s", err.Error())
+	}
+	if mConf.StoreMode != proto.StoreModeRocksDb {
+		return nil
+	}
+	if m.rocksdbCleaner.IsCleanPending(mConf.PartitionId) {
+		return nil
+	}
+
+	mp := &metaPartition{config: mConf}
+	if err = m.rocksdbCleaner.AddTask(mp); err != nil {
+		return errors.NewErrorf("[CheckRocksdbMetaPartition]: AddTask mp(%d) err:%s", mConf.PartitionId, err.Error())
+	}
+	return nil
 }

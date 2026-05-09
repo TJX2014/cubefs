@@ -260,14 +260,22 @@ const (
 	cfgDiskReservedSpace = "diskReservedSpace"
 
 	// NOTE: metanode rocksdb config
-	cfgRocksdbWriteBufferSize       = "rocksdbWriteBufferSize"       // int
-	cfgRocksdbWriteBufferNum        = "rocksdbWriteBufferNum"        // int
-	cfgRocksdbBlockCacheSize        = "rocksdbBlockCacheSize"        // uint64
-	cfgRocksdbMinWriteBufferToMerge = "rocksdbMinWriteBufferToMerge" // int
-	cfgRocksdbMaxSubCompactions     = "rocksdbMaxSubCompactions"     // int
-	cfgRocksdbMode                  = "rocksdbMode"                  // string
-	cfgRocksdbKeyNumMax             = "rocksdbKeyNumMax"
-	CfgRocksDBDiskUsageThreshold    = "rocksDBDiskUsageThreshold"
+	cfgRocksdbWriteBufferSize          = "rocksdbWriteBufferSize"       // int
+	cfgRocksdbWriteBufferNum           = "rocksdbWriteBufferNum"        // int
+	cfgRocksdbBlockCacheSize           = "rocksdbBlockCacheSize"        // uint64
+	cfgRocksdbMinWriteBufferToMerge    = "rocksdbMinWriteBufferToMerge" // int
+	cfgRocksdbMaxSubCompactions        = "rocksdbMaxSubCompactions"     // int
+	cfgRocksdbMode                     = "rocksdbMode"                  // string
+	cfgRocksdbEnableStats              = "rocksdbEnableStats"
+	cfgRocksdbKeyNumMax                = "rocksdbKeyNumMax"
+	cfgRocksdbBytesPerSync             = "rocksdbBytesPerSync"             // uint64
+	cfgRocksdbParallelism              = "rocksdbParallelism"              // int
+	cfgRocksdbMaxBackgroundCompactions = "rocksdbMaxBackgroundCompactions" // int
+	cfgRocksdbMaxBackgroundFlushes     = "rocksdbMaxBackgroundFlushes"     // int
+	cfgRocksdbSoftCompactionLimit      = "rocksdbSoftCompactionLimit"      // int64
+	cfgRocksdbHardCompactionLimit      = "rocksdbHardCompactionLimit"      // int64
+	cfsRocksdbPeriodicCompactSecond    = "rocksdbPeriodicCompactSecond"
+	CfgRocksDBDiskUsageThreshold       = "rocksDBDiskUsageThreshold"
 )
 
 const (
@@ -286,6 +294,7 @@ const (
 	DefaultGOGCValue                   = 100
 	defaultDiskReservedSpace           = 5 * GB
 	defaultRocksdbKeyNumMax            = 2000000000
+	defaultPeriodicCompactSec          = 86400
 	AccessTimeOffset                   = 52
 )
 

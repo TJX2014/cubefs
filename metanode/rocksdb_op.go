@@ -32,15 +32,21 @@ import (
 )
 
 const (
-	DefaultCacheSize           = 256 * util.MB
-	DefaultWriteBuffSize       = 256 * util.MB
-	DefaultWriteBuffNum        = 4
-	DefaultMinWriteBuffToMerge = 4
-	DefaultMaxSubCompaction    = 4
-	DefaultRetryCount          = 3
-	DefaultMaxLogFileSize      = 1 * util.MB
-	DefaultLogFileRollTime     = 3 * 24 * time.Hour // NOTE: 3 day
-	DefaultKeepLogFileNum      = 3
+	DefaultCacheSize                = 256 * util.MB
+	DefaultWriteBuffSize            = 256 * util.MB
+	DefaultWriteBuffNum             = 4
+	DefaultMinWriteBuffToMerge      = 4
+	DefaultMaxSubCompaction         = 4
+	DefaultRetryCount               = 3
+	DefaultMaxLogFileSize           = 1 * util.MB
+	DefaultLogFileRollTime          = 3 * 24 * time.Hour // NOTE: 3 day
+	DefaultKeepLogFileNum           = 3
+	DefaultBytesPerSync             = 1 * util.MB
+	DefaultParallelism              = 32
+	DefaultMaxBackgroundCompactions = 16
+	DefaultMaxBackgroundFlushes     = 16
+	DefaultSoftCompactionLimit      = 512 * util.GB
+	DefaultHardCompactionLimit      = 2 * util.TB
 )
 
 var (
@@ -167,99 +173,146 @@ func (db *RocksdbOperator) CloseDb() (err error) {
 	return
 }
 
+type RocksDBOptions struct {
+	Dir                      string
+	WriteBufferSize          int
+	WriteBufferNum           int
+	MinWriteBuffToMerge      int
+	MaxSubCompactions        int
+	BlockCacheSize           uint64
+	MaxLogFileSize           int
+	LogFileTimeToRoll        time.Duration
+	KeepLogFileNum           int
+	EnableStats              bool
+	BytesPerSync             uint64
+	Parallelism              int
+	MaxBackgroundCompactions int
+	MaxBackgroundFlushes     int
+	SoftCompactionLimit      uint64
+	HardCompactionLimit      uint64
+	PeriodicCompactSec       int64
+}
+
 func (dbInfo *RocksdbOperator) newRocksdbOptions(
-	writeBufferSize int,
-	writeBufferNum int,
-	minWriteBuffToMerge int,
-	maxSubCompactions int,
-	blockCacheSize uint64,
-	maxLogFileSize int,
-	logFileTimeToRoll time.Duration,
-	keepLogFileNum int) (opts *gorocksdb.Options, cache *gorocksdb.Cache, tableOpts *gorocksdb.BlockBasedTableOptions) {
-	opts = gorocksdb.NewDefaultOptions()
+	opts *RocksDBOptions) (dbOpts *gorocksdb.Options, cache *gorocksdb.Cache, tableOpts *gorocksdb.BlockBasedTableOptions) {
+	dbOpts = gorocksdb.NewDefaultOptions()
 
-	// NOTE: check and set default options
-	if writeBufferSize == 0 {
-		writeBufferSize = DefaultWriteBuffSize
+	if opts.WriteBufferSize == 0 {
+		opts.WriteBufferSize = DefaultWriteBuffSize
 	}
-	if writeBufferNum == 0 {
-		writeBufferNum = DefaultWriteBuffNum
+	if opts.WriteBufferNum == 0 {
+		opts.WriteBufferNum = DefaultWriteBuffNum
 	}
-	if minWriteBuffToMerge == 0 {
-		minWriteBuffToMerge = DefaultMinWriteBuffToMerge
+	if opts.MinWriteBuffToMerge == 0 {
+		opts.MinWriteBuffToMerge = DefaultMinWriteBuffToMerge
 	}
-	if maxLogFileSize == 0 {
-		maxLogFileSize = DefaultMaxLogFileSize
+	if opts.MaxSubCompactions == 0 {
+		opts.MaxSubCompactions = DefaultMaxSubCompaction
 	}
-	if logFileTimeToRoll == 0 {
-		logFileTimeToRoll = DefaultLogFileRollTime
+	if opts.MaxLogFileSize == 0 {
+		opts.MaxLogFileSize = DefaultMaxLogFileSize
 	}
-	if keepLogFileNum == 0 {
-		keepLogFileNum = DefaultKeepLogFileNum
+	if opts.LogFileTimeToRoll == 0 {
+		opts.LogFileTimeToRoll = DefaultLogFileRollTime
 	}
-	if blockCacheSize == 0 {
-		blockCacheSize = DefaultCacheSize
+	if opts.KeepLogFileNum == 0 {
+		opts.KeepLogFileNum = DefaultKeepLogFileNum
+	}
+	if opts.BlockCacheSize == 0 {
+		opts.BlockCacheSize = DefaultCacheSize
+	}
+	if opts.BytesPerSync == 0 {
+		opts.BytesPerSync = DefaultBytesPerSync
+	}
+	if opts.Parallelism == 0 {
+		opts.Parallelism = DefaultParallelism
+	}
+	if opts.MaxBackgroundCompactions == 0 {
+		opts.MaxBackgroundCompactions = DefaultMaxBackgroundCompactions
+	}
+	if opts.MaxBackgroundFlushes == 0 {
+		opts.MaxBackgroundFlushes = DefaultMaxBackgroundFlushes
+	}
+	if opts.SoftCompactionLimit == 0 {
+		opts.SoftCompactionLimit = DefaultSoftCompactionLimit
+	}
+	if opts.HardCompactionLimit == 0 {
+		opts.HardCompactionLimit = DefaultHardCompactionLimit
 	}
 
-	// NOTE: main options
-	opts.SetCreateIfMissing(true)
-	opts.SetWriteBufferSize(writeBufferSize)
-	opts.SetMaxWriteBufferNumber(writeBufferNum)
-	opts.SetCompression(gorocksdb.NoCompression)
-	opts.SetMinWriteBufferNumberToMerge(minWriteBuffToMerge)
-	opts.SetLevelCompactionDynamicLevelBytes(true)
-	opts.EnableStatistics()
+	dbOpts.SetCreateIfMissing(true)
+	dbOpts.SetWriteBufferSize(opts.WriteBufferSize)
+	dbOpts.SetMaxWriteBufferNumber(opts.WriteBufferNum)
+	dbOpts.SetCompression(gorocksdb.NoCompression)
+	dbOpts.SetMinWriteBufferNumberToMerge(opts.MinWriteBuffToMerge)
+	dbOpts.SetLevelCompactionDynamicLevelBytes(true)
 	tableOpts = gorocksdb.NewDefaultBlockBasedTableOptions()
-	cache = gorocksdb.NewLRUCache(blockCacheSize)
+	cache = gorocksdb.NewLRUCache(opts.BlockCacheSize)
 	tableOpts.SetBlockCache(cache)
-	opts.SetBlockBasedTableFactory(tableOpts)
+	dbOpts.SetBlockBasedTableFactory(tableOpts)
 
-	// NOTE: rocksdb log file options
-	opts.SetMaxLogFileSize(maxLogFileSize)
-	opts.SetLogFileTimeToRoll(int(logFileTimeToRoll.Seconds()))
-	opts.SetKeepLogFileNum(keepLogFileNum)
+	dbOpts.SetMaxLogFileSize(opts.MaxLogFileSize)
+	dbOpts.SetLogFileTimeToRoll(int(opts.LogFileTimeToRoll.Seconds()))
+	dbOpts.SetKeepLogFileNum(opts.KeepLogFileNum)
+	if opts.EnableStats {
+		dbOpts.EnableStatistics()
+	}
+	dbOpts.SetBytesPerSync(opts.BytesPerSync)
+	dbOpts.IncreaseParallelism(opts.Parallelism)
+	dbOpts.SetMaxBackgroundCompactions(opts.MaxBackgroundCompactions)
+	dbOpts.SetMaxBackgroundFlushes(opts.MaxBackgroundFlushes)
+	dbOpts.SetSoftPendingCompactionBytesLimit(opts.SoftCompactionLimit)
+	dbOpts.SetHardPendingCompactionBytesLimit(opts.HardCompactionLimit)
 	return
 }
 
-func (dbInfo *RocksdbOperator) doOpen(dir string, writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int, blockCacheSize uint64, maxLogFileSize int, logFileTimeToRoll time.Duration, keepLogFileNum int) (err error) {
+func (dbInfo *RocksdbOperator) doOpen(opts *RocksDBOptions) (err error) {
 	var stat fs.FileInfo
 
-	stat, err = os.Stat(dir)
+	stat, err = os.Stat(opts.Dir)
 	if err == nil && !stat.IsDir() {
-		log.LogErrorf("interOpenDb path:[%s] is not dir", dir)
-		return fmt.Errorf("path:[%s] is not dir", dir)
+		log.LogErrorf("interOpenDb path:[%s] is not dir", opts.Dir)
+		return fmt.Errorf("path:[%s] is not dir", opts.Dir)
 	}
 
 	if err != nil && !os.IsNotExist(err) {
-		log.LogErrorf("interOpenDb stat error: dir: %v, err: %v", dir, err)
+		log.LogErrorf("interOpenDb stat error: dir: %v, err: %v", opts.Dir, err)
 		return err
 	}
 
 	// NOTE: mkdir all  will return nil when path exist and path is dir
-	if err = os.MkdirAll(dir, os.ModePerm); err != nil {
-		log.LogErrorf("interOpenDb mkdir error: dir: %v, err: %v", dir, err)
+	if err = os.MkdirAll(opts.Dir, os.ModePerm); err != nil {
+		log.LogErrorf("interOpenDb mkdir error: dir: %v, err: %v", opts.Dir, err)
 		return err
 	}
 
-	log.LogInfof("[doOpen] rocksdb dir(%v)", dir)
-	dbInfo.openOption, dbInfo.cache, dbInfo.tableOption = dbInfo.newRocksdbOptions(writeBufferSize, writeBufferNum, minWriteBuffToMerge, maxSubCompactions, blockCacheSize, maxLogFileSize, logFileTimeToRoll, keepLogFileNum)
-	dbInfo.setOpenConfig(writeBufferSize, writeBufferNum, minWriteBuffToMerge, maxSubCompactions)
+	log.LogInfof("[doOpen] rocksdb dir(%v)", opts.Dir)
+	dbInfo.openOption, dbInfo.cache, dbInfo.tableOption = dbInfo.newRocksdbOptions(opts)
+	dbInfo.setOptToConfig(opts)
 
-	dbInfo.db, err = gorocksdb.OpenDb(dbInfo.openOption, dir)
+	dbInfo.db, err = gorocksdb.OpenDb(dbInfo.openOption, opts.Dir)
 
 	if err != nil {
 		log.LogErrorf("interOpenDb open db err:%v", err)
 		return ErrRocksdbOperation
 	}
-	dbInfo.dir = dir
+	dbInfo.dir = opts.Dir
 	dbInfo.readOption = gorocksdb.NewDefaultReadOptions()
 	dbInfo.writeOption = gorocksdb.NewDefaultWriteOptions()
 	// NOTE: we use raft wal, enable rocksdb wal is unnecessary
 	dbInfo.writeOption.DisableWAL(true)
+	if opts.PeriodicCompactSec > 0 {
+		err = dbInfo.db.SetOptions([]string{"periodic_compaction_seconds"}, []string{strconv.FormatInt(opts.PeriodicCompactSec, 10)})
+		if err != nil {
+			err = fmt.Errorf("set option [periodic_compaction_seconds=%d] failed: %v", opts.PeriodicCompactSec, err)
+			log.LogErrorf(err.Error())
+			return err
+		}
+	}
 	return nil
 }
 
-func (dbInfo *RocksdbOperator) OpenDb(dir string, writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int, blockCacheSize uint64, maxLogFileSize int, logFileTimeToRoll time.Duration, keepLogFileNum int) (err error) {
+func (dbInfo *RocksdbOperator) OpenDb(opts *RocksDBOptions) (err error) {
 	ok := atomic.CompareAndSwapUint32(&dbInfo.state, dbInitSt, dbOpenningSt)
 	ok = ok || atomic.CompareAndSwapUint32(&dbInfo.state, dbClosedSt, dbOpenningSt)
 	if !ok {
@@ -275,16 +328,16 @@ func (dbInfo *RocksdbOperator) OpenDb(dir string, writeBufferSize int, writeBuff
 		if err == nil {
 			atomic.CompareAndSwapUint32(&dbInfo.state, dbOpenningSt, dbOpenedSt)
 		} else {
-			log.LogErrorf("OpenDb failed, dir:%s error:%v", dir, err)
+			log.LogErrorf("OpenDb failed, dir:%s error:%v", opts.Dir, err)
 			atomic.CompareAndSwapUint32(&dbInfo.state, dbOpenningSt, dbInitSt)
 		}
 		dbInfo.mutex.Unlock()
 	}()
 
-	return dbInfo.doOpen(dir, writeBufferSize, writeBufferNum, minWriteBuffToMerge, maxSubCompactions, blockCacheSize, maxLogFileSize, logFileTimeToRoll, keepLogFileNum)
+	return dbInfo.doOpen(opts)
 }
 
-func (dbInfo *RocksdbOperator) ReOpenDb(dir string, writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int, blockCacheSize uint64, maxLogFileSize int, logFileTimeToRoll time.Duration, keepLogFileNum int) (err error) {
+func (dbInfo *RocksdbOperator) ReOpenDb(opts *RocksDBOptions) (err error) {
 	if ok := atomic.CompareAndSwapUint32(&dbInfo.state, dbClosedSt, dbOpenningSt); !ok {
 		if atomic.LoadUint32(&dbInfo.state) == dbOpenedSt {
 			// already opened
@@ -303,11 +356,11 @@ func (dbInfo *RocksdbOperator) ReOpenDb(dir string, writeBufferSize int, writeBu
 		dbInfo.mutex.Unlock()
 	}()
 
-	if dbInfo == nil || (dbInfo.dir != "" && dbInfo.dir != dir) {
+	if dbInfo == nil || (dbInfo.dir != "" && dbInfo.dir != opts.Dir) {
 		return fmt.Errorf("rocks db dir changed, need new db instance")
 	}
 
-	return dbInfo.doOpen(dir, writeBufferSize, writeBufferNum, minWriteBuffToMerge, maxSubCompactions, blockCacheSize, maxLogFileSize, logFileTimeToRoll, keepLogFileNum)
+	return dbInfo.doOpen(opts)
 }
 
 func (dbInfo *RocksdbOperator) GetStatistics() string {
@@ -368,24 +421,15 @@ func (dbInfo *RocksdbOperator) GetOptions() map[string]string {
 	return ret
 }
 
-func (dbInfo *RocksdbOperator) setOpenConfig(writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int) {
-	if writeBufferSize == 0 {
-		writeBufferSize = DefaultWriteBuffSize
-	}
-	if writeBufferNum == 0 {
-		writeBufferNum = DefaultWriteBuffNum
-	}
-	if minWriteBuffToMerge == 0 {
-		minWriteBuffToMerge = DefaultMinWriteBuffToMerge
-	}
-	if maxSubCompactions == 0 {
-		maxSubCompactions = DefaultMaxSubCompaction
-	}
-
-	dbInfo.config["write_buffer_size"] = strconv.Itoa(writeBufferSize)
-	dbInfo.config["max_write_buffer_number"] = strconv.Itoa(writeBufferNum)
-	dbInfo.config["min_write_buffer_number_to_merge"] = strconv.Itoa(minWriteBuffToMerge)
-	dbInfo.config["max_subcompactions"] = strconv.Itoa(maxSubCompactions)
+func (dbInfo *RocksdbOperator) setOptToConfig(opts *RocksDBOptions) {
+	dbInfo.config["write_buffer_size"] = strconv.Itoa(opts.WriteBufferSize)
+	dbInfo.config["max_write_buffer_number"] = strconv.Itoa(opts.WriteBufferNum)
+	dbInfo.config["min_write_buffer_number_to_merge"] = strconv.Itoa(opts.MinWriteBuffToMerge)
+	dbInfo.config["max_subcompactions"] = strconv.Itoa(opts.MaxSubCompactions)
+	dbInfo.config["bytes_per_sync"] = strconv.FormatUint(opts.BytesPerSync, 10)
+	dbInfo.config["max_background_compactions"] = strconv.Itoa(opts.MaxBackgroundCompactions)
+	dbInfo.config["max_background_flushes"] = strconv.Itoa(opts.MaxBackgroundFlushes)
+	dbInfo.config["periodic_compaction_seconds"] = strconv.FormatInt(opts.PeriodicCompactSec, 10)
 }
 
 func (dbInfo *RocksdbOperator) rangeWithIter(it *gorocksdb.Iterator, start []byte, end []byte, cb func(k, v []byte) (bool, error)) error {

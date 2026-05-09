@@ -29,7 +29,24 @@ var (
 	ErrUnregisteredRocksdbPath = errors.New("rocksdb path unregister")
 	ErrRocksdbPathRegistered   = errors.New("rocksdb path already registered")
 	ErrRocksdbOpened           = errors.New("rocksdb stil in use")
+	ErrRocksdbNoResource       = errors.New("rocksdb no resource")
 )
+
+type RocksdbManagerConfig struct {
+	WriteBufferSize          int    `json:"writeBufferSize"`
+	WriteBufferNum           int    `json:"writeBufferNum"`
+	MinWriteBuffToMerge      int    `json:"minWriteBuffToMerge"`
+	MaxSubCompactions        int    `json:"maxSubCompactions"`
+	BlockCacheSize           uint64 `json:"blockCacheSize"`
+	EnableStats              bool   `json:"enableStats"`
+	BytesPerSync             uint64 `json:"bytesPerSync"`
+	Parallelism              int    `json:"parallelism"`
+	MaxBackgroundCompactions int    `json:"maxBackgroundCompactions"`
+	MaxBackgroundFlushes     int    `json:"maxBackgroundFlushes"`
+	SoftCompactionLimit      uint64 `json:"softCompactionLimit"`
+	HardCompactionLimit      uint64 `json:"hardCompactionLimit"`
+	PeriodicCompactSec       int64  `json:"periodicCompactSecond"`
+}
 
 type RocksdbManager interface {
 	Register(dbPath string) (err error)
@@ -53,14 +70,22 @@ type RocksdbHandle struct {
 }
 
 type PerDiskRocksdbManager struct {
-	writeBufferSize     int
-	writeBufferNum      int
-	minWriteBuffToMerge int
-	maxSubCompactions   int
-	blockCacheSize      uint64
-	mutex               sync.Mutex
-	dbs                 map[string]*RocksdbHandle
-	configs             map[string]map[string]string
+	writeBufferSize          int
+	writeBufferNum           int
+	minWriteBuffToMerge      int
+	maxSubCompactions        int
+	blockCacheSize           uint64
+	enableStats              bool
+	bytesPerSync             uint64
+	parallelism              int
+	maxBackgroundCompactions int
+	maxBackgroundFlushes     int
+	softCompactionLimit      uint64
+	hardCompactionLimit      uint64
+	periodicCompactSec       int64
+	mutex                    sync.Mutex
+	dbs                      map[string]*RocksdbHandle
+	configs                  map[string]map[string]string
 }
 
 func (r *PerDiskRocksdbManager) Register(dbPath string) (err error) {
@@ -108,7 +133,23 @@ func (r *PerDiskRocksdbManager) OpenRocksdb(dbPath string, metaPartitionId uint6
 	}
 	handle.rc += 1
 	if handle.rc == 1 {
-		err = handle.db.OpenDb(dbPath, r.writeBufferSize, r.writeBufferNum, r.minWriteBuffToMerge, r.maxSubCompactions, r.blockCacheSize, 0, 0, 0)
+		opts := &RocksDBOptions{
+			Dir:                      dbPath,
+			WriteBufferSize:          r.writeBufferSize,
+			WriteBufferNum:           r.writeBufferNum,
+			MinWriteBuffToMerge:      r.minWriteBuffToMerge,
+			MaxSubCompactions:        r.maxSubCompactions,
+			BlockCacheSize:           r.blockCacheSize,
+			EnableStats:              r.enableStats,
+			BytesPerSync:             r.bytesPerSync,
+			Parallelism:              r.parallelism,
+			MaxBackgroundCompactions: r.maxBackgroundCompactions,
+			MaxBackgroundFlushes:     r.maxBackgroundFlushes,
+			SoftCompactionLimit:      r.softCompactionLimit,
+			HardCompactionLimit:      r.hardCompactionLimit,
+			PeriodicCompactSec:       r.periodicCompactSec,
+		}
+		err = handle.db.OpenDb(opts)
 		if err != nil {
 			handle.rc -= 1
 			return
@@ -161,6 +202,10 @@ func (r *PerDiskRocksdbManager) SelectRocksdbDisk(usableFactor float64) (disk st
 		}
 		stat.PartitionCount = handle.partitions
 		stats = append(stats, stat)
+	}
+	if len(stats) == 0 {
+		err = ErrRocksdbNoResource
+		return
 	}
 	d, err := diskmon.SelectDisk(stats, usableFactor)
 	if err != nil {
@@ -259,14 +304,22 @@ func (r *PerDiskRocksdbManager) GetConfig(dbPath string) (map[string]string, err
 var _ RocksdbManager = &PerDiskRocksdbManager{}
 
 type PerPartitionRocksdbManager struct {
-	writeBufferSize     int
-	writeBufferNum      int
-	minWriteBuffToMerge int
-	maxSubCompactions   int
-	blockCacheSize      uint64
-	mutex               sync.Mutex
-	partitionCnt        map[string]int
-	dbs                 map[string]interface{}
+	writeBufferSize          int
+	writeBufferNum           int
+	minWriteBuffToMerge      int
+	maxSubCompactions        int
+	blockCacheSize           uint64
+	enableStats              bool
+	bytesPerSync             uint64
+	parallelism              int
+	maxBackgroundCompactions int
+	maxBackgroundFlushes     int
+	softCompactionLimit      uint64
+	hardCompactionLimit      uint64
+	periodicCompactSec       int64
+	mutex                    sync.Mutex
+	partitionCnt             map[string]int
+	dbs                      map[string]interface{}
 }
 
 func (r *PerPartitionRocksdbManager) AttachPartition(dbPath string) (err error) {
@@ -332,7 +385,22 @@ func (r *PerPartitionRocksdbManager) OpenRocksdb(dbPath string, metaPartitionId 
 	mpPath := fmt.Sprintf("metaPartition_%v", metaPartitionId)
 	perPartitionDbDir := path.Join(dbPath, mpPath)
 	db = NewRocksdb()
-	err = db.OpenDb(perPartitionDbDir, r.writeBufferSize, r.writeBufferNum, r.minWriteBuffToMerge, r.maxSubCompactions, r.blockCacheSize, 0, 0, 0)
+	err = db.OpenDb(&RocksDBOptions{
+		Dir:                      perPartitionDbDir,
+		WriteBufferSize:          r.writeBufferSize,
+		WriteBufferNum:           r.writeBufferNum,
+		MinWriteBuffToMerge:      r.minWriteBuffToMerge,
+		MaxSubCompactions:        r.maxSubCompactions,
+		BlockCacheSize:           r.blockCacheSize,
+		EnableStats:              r.enableStats,
+		BytesPerSync:             r.bytesPerSync,
+		Parallelism:              r.parallelism,
+		MaxBackgroundCompactions: r.maxBackgroundCompactions,
+		MaxBackgroundFlushes:     r.maxBackgroundFlushes,
+		SoftCompactionLimit:      r.softCompactionLimit,
+		HardCompactionLimit:      r.hardCompactionLimit,
+		PeriodicCompactSec:       r.periodicCompactSec,
+	})
 	return
 }
 
@@ -409,28 +477,44 @@ func (r *PerPartitionRocksdbManager) SetForbidden(dbPath string, forbidden bool)
 
 var _ RocksdbManager = &PerPartitionRocksdbManager{}
 
-func NewPerDiskRocksdbManager(writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int, blockCacheSize uint64) (p RocksdbManager) {
+func NewPerDiskRocksdbManager(config *RocksdbManagerConfig) (p RocksdbManager) {
 	p = &PerDiskRocksdbManager{
-		writeBufferSize:     writeBufferSize,
-		writeBufferNum:      writeBufferNum,
-		minWriteBuffToMerge: minWriteBuffToMerge,
-		maxSubCompactions:   maxSubCompactions,
-		blockCacheSize:      blockCacheSize,
-		dbs:                 make(map[string]*RocksdbHandle),
-		configs:             make(map[string]map[string]string),
+		writeBufferSize:          config.WriteBufferSize,
+		writeBufferNum:           config.WriteBufferNum,
+		minWriteBuffToMerge:      config.MinWriteBuffToMerge,
+		maxSubCompactions:        config.MaxSubCompactions,
+		blockCacheSize:           config.BlockCacheSize,
+		enableStats:              config.EnableStats,
+		bytesPerSync:             config.BytesPerSync,
+		parallelism:              config.Parallelism,
+		maxBackgroundCompactions: config.MaxBackgroundCompactions,
+		maxBackgroundFlushes:     config.MaxBackgroundFlushes,
+		softCompactionLimit:      config.SoftCompactionLimit,
+		hardCompactionLimit:      config.HardCompactionLimit,
+		periodicCompactSec:       config.PeriodicCompactSec,
+		dbs:                      make(map[string]*RocksdbHandle),
+		configs:                  make(map[string]map[string]string),
 	}
 	return
 }
 
-func NewPerPartitionRocksdbManager(writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int, blockCacheSize uint64) (p RocksdbManager) {
+func NewPerPartitionRocksdbManager(config *RocksdbManagerConfig) (p RocksdbManager) {
 	p = &PerPartitionRocksdbManager{
-		writeBufferSize:     writeBufferSize,
-		writeBufferNum:      writeBufferNum,
-		minWriteBuffToMerge: minWriteBuffToMerge,
-		maxSubCompactions:   maxSubCompactions,
-		blockCacheSize:      blockCacheSize,
-		dbs:                 make(map[string]interface{}),
-		partitionCnt:        make(map[string]int),
+		writeBufferSize:          config.WriteBufferSize,
+		writeBufferNum:           config.WriteBufferNum,
+		minWriteBuffToMerge:      config.MinWriteBuffToMerge,
+		maxSubCompactions:        config.MaxSubCompactions,
+		blockCacheSize:           config.BlockCacheSize,
+		enableStats:              config.EnableStats,
+		bytesPerSync:             config.BytesPerSync,
+		parallelism:              config.Parallelism,
+		maxBackgroundCompactions: config.MaxBackgroundCompactions,
+		maxBackgroundFlushes:     config.MaxBackgroundFlushes,
+		softCompactionLimit:      config.SoftCompactionLimit,
+		hardCompactionLimit:      config.HardCompactionLimit,
+		periodicCompactSec:       config.PeriodicCompactSec,
+		dbs:                      make(map[string]interface{}),
+		partitionCnt:             make(map[string]int),
 	}
 	return
 }

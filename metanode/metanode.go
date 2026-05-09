@@ -724,6 +724,23 @@ func (m *MetaNode) newRocksdbManager(cfg *config.Config) (err error) {
 	writeBufferNum := cfg.GetInt(cfgRocksdbWriteBufferNum)
 	minWriteBufferToMerge := cfg.GetInt(cfgRocksdbMinWriteBufferToMerge)
 	maxSubCompactions := cfg.GetInt(cfgRocksdbMaxSubCompactions)
+	enableStats := cfg.GetBoolWithDefault(cfgRocksdbEnableStats, true)
+	bytesPerSync := cfg.GetInt64(cfgRocksdbBytesPerSync)
+	if bytesPerSync < 0 {
+		bytesPerSync = 0
+	}
+	parallelism := cfg.GetInt(cfgRocksdbParallelism)
+	maxBackgroundCompactions := cfg.GetInt(cfgRocksdbMaxBackgroundCompactions)
+	maxBackgroundFlushes := cfg.GetInt(cfgRocksdbMaxBackgroundFlushes)
+	softCompactionLimit := cfg.GetInt64(cfgRocksdbSoftCompactionLimit)
+	if softCompactionLimit < 0 {
+		softCompactionLimit = 0
+	}
+	hardCompactionLimit := cfg.GetInt64(cfgRocksdbHardCompactionLimit)
+	if hardCompactionLimit < 0 {
+		hardCompactionLimit = 0
+	}
+	periodicCompactSec := cfg.GetInt64WithDefault(cfsRocksdbPeriodicCompactSecond, defaultPeriodicCompactSec)
 	mode := cfg.GetString(cfgRocksdbMode)
 	if mode == "" {
 		mode = defaultRocksdMode
@@ -760,10 +777,25 @@ func (m *MetaNode) newRocksdbManager(cfg *config.Config) (err error) {
 		return
 	}
 
+	managerConfig := &RocksdbManagerConfig{
+		WriteBufferSize:          writeBufferSize,
+		WriteBufferNum:           writeBufferNum,
+		MinWriteBuffToMerge:      minWriteBufferToMerge,
+		MaxSubCompactions:        maxSubCompactions,
+		BlockCacheSize:           uint64(blockCacheSize),
+		EnableStats:              enableStats,
+		BytesPerSync:             uint64(bytesPerSync),
+		Parallelism:              parallelism,
+		MaxBackgroundCompactions: maxBackgroundCompactions,
+		MaxBackgroundFlushes:     maxBackgroundFlushes,
+		SoftCompactionLimit:      uint64(softCompactionLimit),
+		HardCompactionLimit:      uint64(hardCompactionLimit),
+		PeriodicCompactSec:       periodicCompactSec,
+	}
 	if rocksdbMode == PerDiskRocksdbMode {
-		m.rocksdbManager = NewPerDiskRocksdbManager(writeBufferSize, writeBufferNum, minWriteBufferToMerge, maxSubCompactions, uint64(blockCacheSize))
+		m.rocksdbManager = NewPerDiskRocksdbManager(managerConfig)
 	} else {
-		m.rocksdbManager = NewPerPartitionRocksdbManager(writeBufferSize, writeBufferNum, minWriteBufferToMerge, maxSubCompactions, uint64(blockCacheSize))
+		m.rocksdbManager = NewPerPartitionRocksdbManager(managerConfig)
 	}
 	for _, dbPath := range m.rocksDirs {
 		err = m.rocksdbManager.Register(dbPath)
@@ -771,6 +803,25 @@ func (m *MetaNode) newRocksdbManager(cfg *config.Config) (err error) {
 			log.LogErrorf("[initRocksdbProvider] failed to init rocksdb provider")
 			return
 		}
+		m.warnIfNotNvmeDevice(dbPath)
 	}
 	return
+}
+
+func (m *MetaNode) warnIfNotNvmeDevice(dbPath string) {
+	if m.metrics != nil && m.metrics.RocksdbNonNvmeDisk != nil {
+		m.metrics.RocksdbNonNvmeDisk.SetWithLabelValues(0, dbPath)
+	}
+	ok, dev, err := isNvmeDisk(dbPath)
+	if err != nil {
+		log.LogWarnf("[newRocksdbManager] failed to detect disk type for rocksdbDir(%v): err(%v)", dbPath, err)
+		return
+	}
+	if ok {
+		return
+	}
+	log.LogWarnf("[newRocksdbManager] rocksdbDir(%v) is not on NVMe device(%v)", dbPath, dev)
+	if m.metrics != nil && m.metrics.RocksdbNonNvmeDisk != nil {
+		m.metrics.RocksdbNonNvmeDisk.SetWithLabelValues(1, dbPath)
+	}
 }
