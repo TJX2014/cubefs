@@ -15,13 +15,30 @@
 package metanode
 
 import (
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/diskmon"
 	"github.com/cubefs/cubefs/util/exporter"
 )
 
-// metrics
+var (
+	rocksdbStatsP99Pattern = regexp.MustCompile(`P99\s*:\s*([0-9]+(?:\.[0-9]+)?)`)
+	rocksdbStatsList       = []string{
+		"rocksdb.db.get.micros",
+		"rocksdb.db.write.micros",
+		"rocksdb.db.seek.micros",
+		"rocksdb.db.write.stall",
+		"rocksdb.db.flush.micros",
+		"rocksdb.sst.read.micros",
+		"rocksdb.bytes.per.read",
+		"rocksdb.bytes.per.write",
+	}
+)
+
 const (
 	StatPeriod = time.Minute * time.Duration(1)
 
@@ -30,7 +47,10 @@ const (
 	MetricMetaPartitionDentryCount = "mpDentryCount"
 	MetricConnectionCount          = "connectionCnt"
 	MetricFileStats                = "fileStats"
+	RocksdbStats                   = "rocksdbStats"
+	RocksdbDiskUsage               = "rocksdbDiskUsage"
 	RocksdbNonNvmeDisk             = "rocksdbNonNvmeDisk"
+	RocksdbDiskError               = "rocksdbDiskError"
 )
 
 type MetaNodeMetrics struct {
@@ -39,7 +59,10 @@ type MetaNodeMetrics struct {
 	MetricMetaPartitionInodeCount  *exporter.GaugeVec
 	MetricMetaPartitionDentryCount *exporter.GaugeVec
 	MetricFileStats                *exporter.GaugeVec
+	RocksdbStats                   *exporter.GaugeVec
+	RocksdbDiskUsage               *exporter.GaugeVec
 	RocksdbNonNvmeDisk             *exporter.GaugeVec
+	RocksdbDiskError               *exporter.GaugeVec
 
 	metricStopCh chan struct{}
 }
@@ -53,12 +76,17 @@ func (m *MetaNode) startStat() {
 		MetricMetaPartitionInodeCount:  exporter.NewGaugeVec(MetricMetaPartitionInodeCount, "", []string{"volName"}),
 		MetricMetaPartitionDentryCount: exporter.NewGaugeVec(MetricMetaPartitionDentryCount, "", []string{"volName"}),
 		MetricFileStats:                exporter.NewGaugeVec(MetricFileStats, "", []string{"volName", "sizeRange"}),
+		RocksdbStats:                   exporter.NewGaugeVec(RocksdbStats, "", []string{"rocksdbDir", "key"}),
+		RocksdbDiskUsage:               exporter.NewGaugeVec(RocksdbDiskUsage, "", []string{"rocksdbDir"}),
 		RocksdbNonNvmeDisk:             exporter.NewGaugeVec(RocksdbNonNvmeDisk, "", []string{"rocksdbDir"}),
+		RocksdbDiskError:               exporter.NewGaugeVec(RocksdbDiskError, "", []string{"rocksdbDir"}),
 	}
 
 	for _, dbPath := range m.rocksDirs {
 		m.warnIfNotNvmeDevice(dbPath)
 	}
+	m.updateRocksdbStatsMetrics()
+	m.updateRocksdbDiskUsageMetrics()
 
 	go m.collectPartitionMetrics()
 }
@@ -100,6 +128,8 @@ func (m *MetaNode) updatePartitionMetrics() {
 func (m *MetaNode) collectPartitionMetrics() {
 	ticker := time.NewTicker(StatPeriod)
 	fileStatTicker := time.NewTicker(fileStatsCheckPeriod)
+	defer ticker.Stop()
+	defer fileStatTicker.Stop()
 	for {
 		select {
 		case <-m.metrics.metricStopCh:
@@ -107,10 +137,73 @@ func (m *MetaNode) collectPartitionMetrics() {
 		case <-ticker.C:
 			m.updatePartitionMetrics()
 			m.metrics.MetricConnectionCount.Set(float64(m.connectionCnt))
+			m.updateRocksdbStatsMetrics()
+			m.updateRocksdbDiskUsageMetrics()
 		case <-fileStatTicker.C:
 			m.updateFileStatsMetrics()
 		}
 	}
+}
+
+func (m *MetaNode) getRocksdbStats() map[string]string {
+	result := make(map[string]string, len(m.rocksDirs))
+	for _, dbPath := range m.rocksDirs {
+		db, err := m.rocksdbManager.OpenRocksdb(dbPath, 0)
+		if err != nil {
+			continue
+		}
+		result[dbPath] = db.GetStatistics()
+		m.rocksdbManager.CloseRocksdb(db)
+	}
+	return result
+}
+
+func (m *MetaNode) updateRocksdbStatsMetrics() {
+	m.metrics.RocksdbStats.Reset()
+	for dbPath, stats := range m.getRocksdbStats() {
+		for key, value := range getStatsP99(stats, rocksdbStatsList) {
+			m.metrics.RocksdbStats.SetWithLabelValues(value, dbPath, key)
+		}
+	}
+}
+
+func (m *MetaNode) updateRocksdbDiskUsageMetrics() {
+	m.metrics.RocksdbDiskUsage.Reset()
+	m.metrics.RocksdbDiskError.Reset()
+	for _, info := range m.getRocksDBDiskStat() {
+		m.metrics.RocksdbDiskUsage.SetWithLabelValues(info.UsageRatio, info.Path)
+		if info.Status == diskmon.Unavailable {
+			m.metrics.RocksdbDiskError.SetWithLabelValues(1, info.Path)
+			continue
+		}
+		m.metrics.RocksdbDiskError.SetWithLabelValues(0, info.Path)
+	}
+}
+
+func getStatsP99(stats string, keys []string) map[string]float64 {
+	metrics := make(map[string]float64)
+	if stats == "" {
+		return metrics
+	}
+
+	lines := strings.Split(stats, "\n")
+	for _, key := range keys {
+		for _, line := range lines {
+			if !strings.Contains(line, key) {
+				continue
+			}
+			matches := rocksdbStatsP99Pattern.FindStringSubmatch(line)
+			if len(matches) != 2 {
+				break
+			}
+			value, err := strconv.ParseFloat(matches[1], 64)
+			if err == nil {
+				metrics[key] = value
+			}
+			break
+		}
+	}
+	return metrics
 }
 
 func (m *MetaNode) updateFileStatsMetrics() {

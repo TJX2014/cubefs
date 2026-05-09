@@ -1511,17 +1511,7 @@ func (m *MetaNode) getRocksdbStatsHandler(w http.ResponseWriter, r *http.Request
 		}
 	}()
 
-	result := make(map[string]string)
-	for _, dbPath := range m.rocksDirs {
-		db, err := m.rocksdbManager.OpenRocksdb(dbPath, 0)
-		if err != nil {
-			log.LogErrorf("[getRocksdbStatsHandler] failed to open rocksdb, err(%v)", err)
-			continue
-		}
-		result[dbPath] = db.GetStatistics()
-		m.rocksdbManager.CloseRocksdb(db)
-	}
-	resp.Data = result
+	resp.Data = m.getRocksdbStats()
 }
 
 func (m *MetaNode) updateRocksDBConfigHandler(w http.ResponseWriter, r *http.Request) {

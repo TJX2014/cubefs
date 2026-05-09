@@ -1009,16 +1009,6 @@ func (mp *metaPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.Sn
 				return
 			}
 		}
-
-		if err = mp.inodeTree.CommitBatchWrite(dbWriteHandle, true); err != nil {
-			log.LogErrorf("ApplyBaseSnapshot: metaPartition(%v) commit write handle failed:%v", mp.config.PartitionId, err)
-			dbWriteHandle = nil
-			return
-		}
-		if err = mp.inodeTree.ClearBatchWriteHandle(dbWriteHandle); err != nil {
-			log.LogErrorf("ApplyBaseSnapshot: metaPartition(%v) create batch write handle failed:%v", mp.config.PartitionId, err)
-			return
-		}
 	}
 }
 
