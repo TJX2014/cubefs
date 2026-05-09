@@ -98,6 +98,13 @@ func (m *MetaNode) registerAPIHandler() (err error) {
 	http.HandleFunc("/setQosEnable", m.setQosEnableHandler)
 	http.HandleFunc("/setMetaQos", m.setMetaQosHandler)
 	http.HandleFunc("/getMetaQos", m.getMetaQosHandler)
+	http.HandleFunc("/getRocksdbStats", m.getRocksdbStatsHandler)
+	http.HandleFunc("/updateRocksDBConfig", m.updateRocksDBConfigHandler)
+	http.HandleFunc("/getRocksDBConfig", m.getRocksDBConfigHandler)
+	http.HandleFunc("/getRocksdbProperty", m.getRocksdbPropertyHandler)
+	http.HandleFunc("/setRocksdbKeyNumMax", m.setRocksdbKeyNumMaxHandler)
+	http.HandleFunc("/compactRocksdb", m.compactRocksdbHandler)
+	http.HandleFunc("/setRocksdbDiskThreshold", m.setRocksdbDiskThresholdHandler)
 	return
 }
 
@@ -1493,4 +1500,235 @@ func (m *MetaNode) getMetaQosHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp.Data = metaQos
+}
+
+func (m *MetaNode) getRocksdbStatsHandler(w http.ResponseWriter, r *http.Request) {
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	defer func() {
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[getRocksdbStatsHandler] response %s", err)
+		}
+	}()
+
+	result := make(map[string]string)
+	for _, dbPath := range m.rocksDirs {
+		db, err := m.rocksdbManager.OpenRocksdb(dbPath, 0)
+		if err != nil {
+			log.LogErrorf("[getRocksdbStatsHandler] failed to open rocksdb, err(%v)", err)
+			continue
+		}
+		result[dbPath] = db.GetStatistics()
+		m.rocksdbManager.CloseRocksdb(db)
+	}
+	resp.Data = result
+}
+
+func (m *MetaNode) updateRocksDBConfigHandler(w http.ResponseWriter, r *http.Request) {
+	var (
+		config map[string]string
+		err    error
+	)
+
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	defer func() {
+		if err != nil {
+			resp.Msg = err.Error()
+			resp.Code = http.StatusBadRequest
+		}
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[updateRocksDBConfigHandler] response %s", err)
+		}
+	}()
+
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	dbDir := r.FormValue("dbDir")
+	if dbDir == "" {
+		err = fmt.Errorf("dbDir is required")
+		return
+	}
+
+	if err = json.NewDecoder(r.Body).Decode(&config); err != nil {
+		log.LogErrorf("[updateRocksDBConfigHandler] failed to decode request, err(%v)", err)
+		return
+	}
+	if err = m.rocksdbManager.UpdateConfig(dbDir, config); err != nil {
+		log.LogErrorf("[updateRocksDBConfigHandler] failed to update rocksdb config, err(%v)", err)
+		return
+	}
+	resp.Msg = fmt.Sprintf("update rocksdb config success: dbDir=%v", dbDir)
+}
+
+func (m *MetaNode) getRocksDBConfigHandler(w http.ResponseWriter, r *http.Request) {
+	var err error
+
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	defer func() {
+		if err != nil {
+			resp.Msg = err.Error()
+			resp.Code = http.StatusBadRequest
+		}
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[getRocksDBConfigHandler] response %s", err)
+		}
+	}()
+
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	dbDir := r.FormValue("dbDir")
+	if dbDir == "" {
+		err = fmt.Errorf("dbDir is required")
+		return
+	}
+
+	resp.Data, err = m.rocksdbManager.GetConfig(dbDir)
+	if err != nil {
+		log.LogErrorf("[getRocksDBConfigHandler] failed to get rocksdb config, err(%v)", err)
+		return
+	}
+}
+
+func (m *MetaNode) getRocksdbPropertyHandler(w http.ResponseWriter, r *http.Request) {
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	var (
+		err     error
+		db      *RocksdbOperator
+		result  string
+		request struct {
+			DbDir    string `json:"dbDir"`
+			Property string `json:"property"`
+		}
+	)
+	defer func() {
+		if err != nil {
+			resp.Msg = err.Error()
+			resp.Code = http.StatusBadRequest
+		}
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[getRocksdbPropertyHandler] response %s", err)
+		}
+	}()
+
+	if err = json.NewDecoder(r.Body).Decode(&request); err != nil {
+		log.LogErrorf("[getRocksdbPropertyHandler] failed to decode request, err(%v)", err)
+		return
+	}
+	db, err = m.rocksdbManager.OpenRocksdb(request.DbDir, 0)
+	if err != nil {
+		log.LogErrorf("[getRocksdbPropertyHandler] failed to open rocksdb, err(%v)", err)
+		return
+	}
+	defer m.rocksdbManager.CloseRocksdb(db)
+	result, err = db.GetProperty(request.Property)
+	if err != nil {
+		log.LogErrorf("[getRocksdbPropertyHandler] failed to get rocksdb property, err(%v)", err)
+		return
+	}
+	resp.Data = result
+}
+
+func (m *MetaNode) setRocksdbKeyNumMaxHandler(w http.ResponseWriter, r *http.Request) {
+	var err error
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	defer func() {
+		if err != nil {
+			resp.Msg = err.Error()
+			resp.Code = http.StatusBadRequest
+		}
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[setRocksdbKeyNumMaxHandler] response %s", err)
+		}
+	}()
+
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	keyNumStr := r.FormValue("num")
+	if keyNumStr == "" {
+		err = fmt.Errorf("missing num parameter")
+		return
+	}
+	keyNumVal, parseErr := strconv.ParseUint(keyNumStr, 10, 64)
+	if parseErr != nil {
+		err = fmt.Errorf("invalid num parameter")
+		return
+	}
+	m.rocksdbKeyNumMax = keyNumVal
+	resp.Msg = fmt.Sprintf("set rocksdb key num max success: num=%v", keyNumVal)
+	m.CheckRocksdbStatus()
+}
+
+func (m *MetaNode) compactRocksdbHandler(w http.ResponseWriter, r *http.Request) {
+	var err error
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	defer func() {
+		if err != nil {
+			resp.Msg = err.Error()
+			resp.Code = http.StatusBadRequest
+		}
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[compactRocksdbHandler] response %s", err)
+		}
+	}()
+
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	dbDir := r.FormValue("dbDir")
+	if dbDir == "" {
+		err = fmt.Errorf("dbDir is required")
+		return
+	}
+	start := time.Now()
+	db, err := m.rocksdbManager.OpenRocksdb(dbDir, 0)
+	if err != nil {
+		log.LogErrorf("[compactRocksdbHandler] failed to open rocksdb, err(%v)", err)
+		return
+	}
+	defer m.rocksdbManager.CloseRocksdb(db)
+	err = db.CompactRange(nil, nil)
+	if err != nil {
+		log.LogErrorf("[compactRocksdbHandler] failed to compact rocksdb, err(%v)", err)
+		return
+	}
+	resp.Msg = fmt.Sprintf("compact rocksdb success: dbDir=%v, costtime=%v", dbDir, time.Since(start))
+}
+
+func (m *MetaNode) setRocksdbDiskThresholdHandler(w http.ResponseWriter, r *http.Request) {
+	var err error
+	resp := NewAPIResponse(http.StatusOK, http.StatusText(http.StatusOK))
+	defer func() {
+		if err != nil {
+			resp.Msg = err.Error()
+			resp.Code = http.StatusBadRequest
+		}
+		data, _ := resp.Marshal()
+		if _, err := w.Write(data); err != nil {
+			log.LogErrorf("[setRocksdbDiskThresholdHandler] response %s", err)
+		}
+	}()
+
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+	thresholdStr := r.FormValue("threshold")
+	if thresholdStr == "" {
+		err = fmt.Errorf("missing threshold parameter")
+		return
+	}
+	threshold, parseErr := strconv.ParseFloat(thresholdStr, 64)
+	if parseErr != nil {
+		err = parseErr
+		return
+	}
+	m.metadataManager.SetRocksdbDiskThreshold(threshold)
+	resp.Msg = fmt.Sprintf("set rocksdb disk threshold success: threshold=%v", threshold)
 }

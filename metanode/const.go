@@ -266,6 +266,8 @@ const (
 	cfgRocksdbMinWriteBufferToMerge = "rocksdbMinWriteBufferToMerge" // int
 	cfgRocksdbMaxSubCompactions     = "rocksdbMaxSubCompactions"     // int
 	cfgRocksdbMode                  = "rocksdbMode"                  // string
+	cfgRocksdbKeyNumMax             = "rocksdbKeyNumMax"
+	CfgRocksDBDiskUsageThreshold    = "rocksDBDiskUsageThreshold"
 )
 
 const (
@@ -283,6 +285,7 @@ const (
 	RaftCommitDiffMax                  = 100
 	DefaultGOGCValue                   = 100
 	defaultDiskReservedSpace           = 5 * GB
+	defaultRocksdbKeyNumMax            = 2000000000
 	AccessTimeOffset                   = 52
 )
 

@@ -223,6 +223,7 @@ const (
 	RunMetaNodeBalanceTask             = "/metaNode/runBalanceTask"
 	StopMetaNodeBalanceTask            = "/metaNode/stopBalanceTask"
 	DeleteMetaNodeBalanceTask          = "/metaNode/deleteBalanceTask"
+	AdminDecommissionRocksdbDir        = "/metaNode/decommissionRocksdbDir"
 	OfflineMetaNode                    = "/metaNode/offline"
 	AdminUpdateDataNode                = "/dataNode/update"
 	AdminGetInvalidNodes               = "/invalid/nodes"
@@ -244,6 +245,7 @@ const (
 	AdminBatchMigrateMp                = "/metaPartition/batchMigrate"
 	AdminBatchPromoteMpLearner         = "/metaPartition/batchPromoteLearner"
 	AdminGetPromoteMpLearnerPlan       = "/metaPartition/getPromoteLearnerPlan"
+	AdminStopPromoteMpLearnerPlan      = "/metaPartition/stopPromoteLearnerPlan"
 	AdminCalcMetaPartitionMd5Sum       = "/metaPartition/calcMd5Sum"
 	AdminGetMd5SumResult               = "/metaPartition/getMd5SumResult"
 
@@ -1044,6 +1046,7 @@ type MetaNodeHeartbeatResponse struct {
 	ReceivedForbidWriteOpOfProtoVer0 bool
 	RocksDBDiskInfo                  []*MetaNodeRocksdbInfo
 	RocksDBKeyNumMax                 uint64
+	RocksdbDiskThreshold             float32
 }
 
 // LcNodeHeartbeatResponse defines the response to the lc node heartbeat.
@@ -1176,6 +1179,7 @@ type MetaPartitionLoadResponse struct {
 	RaftInfo    RaftInfo
 	Md5ApplyId  uint64
 	Md5Sum      string
+	RocksdbDir  string
 }
 
 // DataPartitionResponse defines the response from a data node to the master that is related to a data partition.

@@ -632,11 +632,17 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.AdminGetPromoteMpLearnerPlan).
 		HandlerFunc(m.getPromoteMpLearnerPlan)
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminStopPromoteMpLearnerPlan).
+		HandlerFunc(m.stopPromoteMpLearnerPlan)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
 		Path(proto.AdminCalcMetaPartitionMd5Sum).
 		HandlerFunc(m.calcMetaPartitionMd5Sum)
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
 		Path(proto.AdminGetMd5SumResult).
 		HandlerFunc(m.getMd5SumResult)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.AdminDecommissionRocksdbDir).
+		HandlerFunc(m.decommissionRocksdbDir)
 
 	// data partition management APIs
 	router.NewRoute().Methods(http.MethodGet).

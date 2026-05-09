@@ -1491,6 +1491,7 @@ func (mp *metaPartition) ResponseLoadMetaPartition(p *Packet) (err error) {
 		resp.RaftInfo.RaftStatus = *rStatus
 	}
 	resp.RaftInfo.Hosts = mp.config.Peers
+	resp.RocksdbDir = mp.config.RocksDBDir
 
 	if err != nil {
 		err = errors.Trace(err,

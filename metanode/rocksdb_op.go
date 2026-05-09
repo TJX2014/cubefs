@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,11 +125,13 @@ type RocksdbOperator struct {
 	openOption  *gorocksdb.Options
 	cache       *gorocksdb.Cache
 	tableOption *gorocksdb.BlockBasedTableOptions
+	config      map[string]string
 }
 
 func NewRocksdb() (operator *RocksdbOperator) {
 	operator = &RocksdbOperator{
-		state: dbInitSt,
+		state:  dbInitSt,
+		config: make(map[string]string),
 	}
 	return
 }
@@ -205,6 +208,7 @@ func (dbInfo *RocksdbOperator) newRocksdbOptions(
 	opts.SetCompression(gorocksdb.NoCompression)
 	opts.SetMinWriteBufferNumberToMerge(minWriteBuffToMerge)
 	opts.SetLevelCompactionDynamicLevelBytes(true)
+	opts.EnableStatistics()
 	tableOpts = gorocksdb.NewDefaultBlockBasedTableOptions()
 	cache = gorocksdb.NewLRUCache(blockCacheSize)
 	tableOpts.SetBlockCache(cache)
@@ -239,6 +243,7 @@ func (dbInfo *RocksdbOperator) doOpen(dir string, writeBufferSize int, writeBuff
 
 	log.LogInfof("[doOpen] rocksdb dir(%v)", dir)
 	dbInfo.openOption, dbInfo.cache, dbInfo.tableOption = dbInfo.newRocksdbOptions(writeBufferSize, writeBufferNum, minWriteBuffToMerge, maxSubCompactions, blockCacheSize, maxLogFileSize, logFileTimeToRoll, keepLogFileNum)
+	dbInfo.setOpenConfig(writeBufferSize, writeBufferNum, minWriteBuffToMerge, maxSubCompactions)
 
 	dbInfo.db, err = gorocksdb.OpenDb(dbInfo.openOption, dir)
 
@@ -305,6 +310,13 @@ func (dbInfo *RocksdbOperator) ReOpenDb(dir string, writeBufferSize int, writeBu
 	return dbInfo.doOpen(dir, writeBufferSize, writeBufferNum, minWriteBuffToMerge, maxSubCompactions, blockCacheSize, maxLogFileSize, logFileTimeToRoll, keepLogFileNum)
 }
 
+func (dbInfo *RocksdbOperator) GetStatistics() string {
+	if dbInfo.openOption != nil {
+		return dbInfo.openOption.GetStatisticsString()
+	}
+	return ""
+}
+
 func genRocksDBReadOption(snap *gorocksdb.Snapshot) (ro *gorocksdb.ReadOptions) {
 	ro = gorocksdb.NewDefaultReadOptions()
 	ro.SetFillCache(false)
@@ -314,6 +326,66 @@ func genRocksDBReadOption(snap *gorocksdb.Snapshot) (ro *gorocksdb.ReadOptions) 
 
 func (dbInfo *RocksdbOperator) iterator(ro *gorocksdb.ReadOptions) *gorocksdb.Iterator {
 	return dbInfo.db.NewIterator(ro)
+}
+
+func (dbInfo *RocksdbOperator) GetProperty(property string) (string, error) {
+	if err := dbInfo.accessDb(); err != nil {
+		return "", err
+	}
+	defer dbInfo.releaseDb()
+
+	return dbInfo.db.GetProperty(property), nil
+}
+
+func (dbInfo *RocksdbOperator) SetOptions(config map[string]string) error {
+	if dbInfo.db == nil {
+		return ErrRocksdbAccess
+	}
+
+	dbInfo.mutex.Lock()
+	defer dbInfo.mutex.Unlock()
+
+	for key, val := range config {
+		err := dbInfo.db.SetOptions([]string{key}, []string{val})
+		if err != nil {
+			err = fmt.Errorf("set option [%s=%s] failed: %v", key, val, err)
+			log.LogErrorf(err.Error())
+			return err
+		}
+		dbInfo.config[key] = val
+	}
+	return nil
+}
+
+func (dbInfo *RocksdbOperator) GetOptions() map[string]string {
+	dbInfo.mutex.RLock()
+	defer dbInfo.mutex.RUnlock()
+
+	ret := make(map[string]string, len(dbInfo.config))
+	for key, val := range dbInfo.config {
+		ret[key] = val
+	}
+	return ret
+}
+
+func (dbInfo *RocksdbOperator) setOpenConfig(writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int) {
+	if writeBufferSize == 0 {
+		writeBufferSize = DefaultWriteBuffSize
+	}
+	if writeBufferNum == 0 {
+		writeBufferNum = DefaultWriteBuffNum
+	}
+	if minWriteBuffToMerge == 0 {
+		minWriteBuffToMerge = DefaultMinWriteBuffToMerge
+	}
+	if maxSubCompactions == 0 {
+		maxSubCompactions = DefaultMaxSubCompaction
+	}
+
+	dbInfo.config["write_buffer_size"] = strconv.Itoa(writeBufferSize)
+	dbInfo.config["max_write_buffer_number"] = strconv.Itoa(writeBufferNum)
+	dbInfo.config["min_write_buffer_number_to_merge"] = strconv.Itoa(minWriteBuffToMerge)
+	dbInfo.config["max_subcompactions"] = strconv.Itoa(maxSubCompactions)
 }
 
 func (dbInfo *RocksdbOperator) rangeWithIter(it *gorocksdb.Iterator, start []byte, end []byte, cb func(k, v []byte) (bool, error)) error {

@@ -21,6 +21,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -105,6 +106,8 @@ type MetaNode struct {
 	diskStopCh        chan struct{}
 	disks             map[string]*diskmon.FsCapMon
 	diskReservedSpace uint64
+	rocksdbKeyNumMax  uint64
+	rocksdbKeyNums    sync.Map
 }
 
 // Start starts up the meta node with the specified configuration.
@@ -353,6 +356,11 @@ func (m *MetaNode) parseConfig(cfg *config.Config) (err error) {
 	if m.diskReservedSpace == 0 || m.diskReservedSpace < defaultDiskReservedSpace {
 		m.diskReservedSpace = defaultDiskReservedSpace
 	}
+	rocksdbKeyNumMax := cfg.GetInt64(cfgRocksdbKeyNumMax)
+	if rocksdbKeyNumMax <= 0 {
+		rocksdbKeyNumMax = defaultRocksdbKeyNumMax
+	}
+	m.rocksdbKeyNumMax = uint64(rocksdbKeyNumMax)
 
 	constCfg := config.ConstConfig{
 		Listen:           m.listen,
@@ -505,17 +513,44 @@ func (m *MetaNode) newMetaManager(cfg *config.Config) (err error) {
 		}
 	}
 
+	rocksDBDiskUsageThreshold, err := m.parseRocksDBDiskUsageThreshold(cfg)
+	if err != nil {
+		return err
+	}
+
+	rocksdbKeyNumMax := cfg.GetInt64(cfgRocksdbKeyNumMax)
+	if rocksdbKeyNumMax <= 0 {
+		rocksdbKeyNumMax = defaultRocksdbKeyNumMax
+	}
+	m.rocksdbKeyNumMax = uint64(rocksdbKeyNumMax)
+
 	// load metadataManager
 	conf := MetadataManagerConfig{
-		NodeID:           m.nodeId,
-		RootDir:          m.metadataDir,
-		RaftStore:        m.raftStore,
-		ZoneName:         m.zoneName,
-		EnableGcTimer:    cfg.GetBoolWithDefault(cfgEnableGcTimer, false),
-		GcRecyclePercent: gcRecyclePercent,
+		NodeID:                    m.nodeId,
+		RootDir:                   m.metadataDir,
+		RaftStore:                 m.raftStore,
+		ZoneName:                  m.zoneName,
+		EnableGcTimer:             cfg.GetBoolWithDefault(cfgEnableGcTimer, false),
+		GcRecyclePercent:          gcRecyclePercent,
+		RocksDBDiskUsageThreshold: rocksDBDiskUsageThreshold,
 	}
 	m.metadataManager = NewMetadataManager(conf, m)
 	return
+}
+
+func (m *MetaNode) parseRocksDBDiskUsageThreshold(cfg *config.Config) (float64, error) {
+	rocksDBDiskUsageThresholdStr := cfg.GetString(CfgRocksDBDiskUsageThreshold)
+	if rocksDBDiskUsageThresholdStr == "" {
+		return 0.8, nil
+	}
+
+	rocksDBDiskUsageThreshold, err := strconv.ParseFloat(rocksDBDiskUsageThresholdStr, 64)
+	if err != nil {
+		err = fmt.Errorf("parse configKey[%v] failed: %v", CfgRocksDBDiskUsageThreshold, err.Error())
+		log.LogError(err.Error())
+		return 0, err
+	}
+	return rocksDBDiskUsageThreshold, nil
 }
 
 func (m *MetaNode) startMetaManager() (err error) {

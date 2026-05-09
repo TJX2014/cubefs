@@ -71,16 +71,18 @@ type MetadataManager interface {
 	checkVolVerList() (err error)
 	ReloadPartition(id int) (err error)
 	UpdateQosLimit()
+	SetRocksdbDiskThreshold(threshold float64)
 }
 
 // MetadataManagerConfig defines the configures in the metadata manager.
 type MetadataManagerConfig struct {
-	NodeID           uint64
-	RootDir          string
-	ZoneName         string
-	EnableGcTimer    bool
-	GcRecyclePercent float64
-	RaftStore        raftstore.RaftStore
+	NodeID                    uint64
+	RootDir                   string
+	ZoneName                  string
+	EnableGcTimer             bool
+	GcRecyclePercent          float64
+	RocksDBDiskUsageThreshold float64
+	RaftStore                 raftstore.RaftStore
 }
 
 type verOp2Phase struct {
@@ -93,28 +95,29 @@ type verOp2Phase struct {
 }
 
 type metadataManager struct {
-	nodeId               uint64
-	zoneName             string
-	rootDir              string
-	raftStore            raftstore.RaftStore
-	connPool             *util.ConnectPool
-	state                uint32
-	mu                   sync.RWMutex
-	partitions           map[uint64]MetaPartition // Key: metaRangeId, Val: metaPartition
-	metaNode             *MetaNode
-	fileStatsConfig      *fileStatsConfig
-	curQuotaGoroutineNum int32
-	maxQuotaGoroutineNum int32
-	cpuUtil              atomicutil.Float64
-	stopC                chan struct{}
-	volUpdating          *sync.Map // map[string]*verOp2Phase
-	verUpdateChan        chan string
-	enableGcTimer        bool
-	useLocalGOGC         bool
-	gogcValue            int
-	gcRecyclePercent     float64
-	gcTimer              *util.RecycleTimer
-	limitFactor          map[uint32]*rate.Limiter
+	nodeId                    uint64
+	zoneName                  string
+	rootDir                   string
+	raftStore                 raftstore.RaftStore
+	connPool                  *util.ConnectPool
+	state                     uint32
+	mu                        sync.RWMutex
+	partitions                map[uint64]MetaPartition // Key: metaRangeId, Val: metaPartition
+	metaNode                  *MetaNode
+	fileStatsConfig           *fileStatsConfig
+	curQuotaGoroutineNum      int32
+	maxQuotaGoroutineNum      int32
+	cpuUtil                   atomicutil.Float64
+	stopC                     chan struct{}
+	volUpdating               *sync.Map // map[string]*verOp2Phase
+	verUpdateChan             chan string
+	enableGcTimer             bool
+	useLocalGOGC              bool
+	gogcValue                 int
+	gcRecyclePercent          float64
+	rocksDBDiskUsageThreshold float64
+	gcTimer                   *util.RecycleTimer
+	limitFactor               map[uint32]*rate.Limiter
 
 	rocksDBDirs    []string
 	rocksdbManager RocksdbManager
@@ -937,24 +940,29 @@ func (m *metadataManager) UpdateQosLimit() {
 // NewMetadataManager returns a new metadata manager.
 func NewMetadataManager(conf MetadataManagerConfig, metaNode *MetaNode) MetadataManager {
 	m := &metadataManager{
-		nodeId:               conf.NodeID,
-		zoneName:             conf.ZoneName,
-		rootDir:              conf.RootDir,
-		raftStore:            conf.RaftStore,
-		partitions:           make(map[uint64]MetaPartition),
-		metaNode:             metaNode,
-		maxQuotaGoroutineNum: defaultMaxQuotaGoroutine,
-		volUpdating:          new(sync.Map),
-		gogcValue:            DefaultGOGCValue,
-		enableGcTimer:        conf.EnableGcTimer,
-		gcRecyclePercent:     conf.GcRecyclePercent,
-		limitFactor:          make(map[uint32]*rate.Limiter),
-		rocksDBDirs:          metaNode.rocksDirs,
-		rocksdbManager:       metaNode.rocksdbManager,
+		nodeId:                    conf.NodeID,
+		zoneName:                  conf.ZoneName,
+		rootDir:                   conf.RootDir,
+		raftStore:                 conf.RaftStore,
+		partitions:                make(map[uint64]MetaPartition),
+		metaNode:                  metaNode,
+		maxQuotaGoroutineNum:      defaultMaxQuotaGoroutine,
+		volUpdating:               new(sync.Map),
+		gogcValue:                 DefaultGOGCValue,
+		enableGcTimer:             conf.EnableGcTimer,
+		gcRecyclePercent:          conf.GcRecyclePercent,
+		rocksDBDiskUsageThreshold: conf.RocksDBDiskUsageThreshold,
+		limitFactor:               make(map[uint32]*rate.Limiter),
+		rocksDBDirs:               metaNode.rocksDirs,
+		rocksdbManager:            metaNode.rocksdbManager,
 	}
 	m.limitFactor[readDirIops] = rate.NewLimiter(rate.Limit(metaNode.readDirIops), metaNode.readDirIops/2)
 
 	return m
+}
+
+func (m *metadataManager) SetRocksdbDiskThreshold(threshold float64) {
+	m.rocksDBDiskUsageThreshold = threshold
 }
 
 // isExpiredPartition return whether one partition is expired

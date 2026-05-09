@@ -192,6 +192,12 @@ func (metaNode *MetaNode) updateMetric(resp *proto.MetaNodeHeartbeatResponse, th
 	metaNode.NodeMemTotal = resp.NodeMemTotal
 	metaNode.NodeMemUsed = resp.NodeMemUsed
 	metaNode.RocksdbDiskThreshold = rocksdbDiskThreshold
+	if resp.RocksDBKeyNumMax > 0 {
+		metaNode.RocksdbKeyNumMax = resp.RocksDBKeyNumMax
+	}
+	if resp.RocksdbDiskThreshold > 0 {
+		metaNode.RocksdbDiskThreshold = resp.RocksdbDiskThreshold
+	}
 }
 
 func (metaNode *MetaNode) reachesThreshold() bool {
@@ -260,7 +266,17 @@ func (metaNode *MetaNode) systemMemoryReachesThreshold() bool {
 }
 
 func (metaNode *MetaNode) rocksdbDiskKeyNumUnderMax() bool {
-	return true
+	if metaNode.RocksdbKeyNumMax <= 0 {
+		return true
+	}
+
+	for _, disk := range metaNode.RocksdbDisks {
+		if disk.KeyNum < metaNode.RocksdbKeyNumMax {
+			return true
+		}
+	}
+
+	return false
 }
 
 // LeaderMetaNode define the leader metaPartitions in meta node
@@ -391,7 +407,9 @@ func (metaNode *MetaNode) isWritable(storeMode proto.StoreMode) (ok bool) {
 				ok = true
 			}
 		case proto.StoreModeRocksDb:
-			if !metaNode.RdOnly && !metaNode.reachesRocksdbDisksThreshold() {
+			if !metaNode.RdOnly && !metaNode.RocksdbRdOnly &&
+				!metaNode.reachesRocksdbDisksThreshold() &&
+				metaNode.rocksdbDiskKeyNumUnderMax() {
 				ok = true
 			}
 		default:

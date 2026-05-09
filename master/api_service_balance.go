@@ -52,6 +52,8 @@ type MetaPartitionPlanUserParams struct {
 	ZoneName           string          `json:"zoneName"`
 	NodeSetID          uint64          `json:"nodesetId"`
 	SelectTag          string          `json:"selectTag"`
+	MetaNodeAddr       string          `json:"metaNodeAddr"`
+	RocksdbDir         string          `json:"rocksdbDir"`
 }
 
 func (m *Server) getMetaPartitionEmptyStatus(w http.ResponseWriter, r *http.Request) {
@@ -782,6 +784,9 @@ func parseMetaPartitionPlanUserParams(r *http.Request) (param *MetaPartitionPlan
 		return
 	}
 
+	param.MetaNodeAddr = r.FormValue(addrKey)
+	param.RocksdbDir = r.FormValue(RocksdbDirKey)
+
 	return
 }
 
@@ -889,6 +894,30 @@ func (m *Server) getPromoteMpLearnerPlan(w http.ResponseWriter, r *http.Request)
 	sendOkReply(w, r, newSuccessHTTPReply(plan))
 }
 
+func (m *Server) stopPromoteMpLearnerPlan(w http.ResponseWriter, r *http.Request) {
+	var (
+		err   error
+		force bool
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminStopPromoteMpLearnerPlan))
+	defer func() {
+		doStatAndMetric(proto.AdminStopPromoteMpLearnerPlan, metric, err, nil)
+	}()
+
+	if value := r.FormValue(forceKey); value != "" {
+		force, _ = strconv.ParseBool(value)
+	}
+
+	err = m.cluster.StopMetaPartitionBalanceTask(force)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+		return
+	}
+
+	AuditLog(r, "stopPromoteMpLearnerPlan", "stop promote learner plan", nil)
+	sendOkReply(w, r, newSuccessHTTPReply("Stop promote learner plan successfully."))
+}
+
 func (m *Server) calcMetaPartitionMd5Sum(w http.ResponseWriter, r *http.Request) {
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminCalcMetaPartitionMd5Sum))
 	var err error
@@ -953,6 +982,43 @@ func (m *Server) getMd5SumResult(w http.ResponseWriter, r *http.Request) {
 
 	if plan == nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: "no check sum plan"})
+		return
+	}
+
+	sendOkReply(w, r, newSuccessHTTPReply(plan))
+}
+
+func (m *Server) decommissionRocksdbDir(w http.ResponseWriter, r *http.Request) {
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminDecommissionRocksdbDir))
+	var (
+		err   error
+		param *MetaPartitionPlanUserParams
+	)
+	defer func() {
+		doStatAndMetric(proto.AdminDecommissionRocksdbDir, metric, err, nil)
+	}()
+
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
+
+	param, err = parseMetaPartitionPlanUserParams(r)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	if param.MetaNodeAddr == "" || param.RocksdbDir == "" {
+		err = fmt.Errorf("meta node addr or rocksdb dir is required")
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	plan, err := m.cluster.CreateDecommissionRocksdbDirPlan(param)
+	if err != nil {
+		log.LogErrorf("CreateDecommissionRocksdbDirPlan failed: %s", err.Error())
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
 		return
 	}
 

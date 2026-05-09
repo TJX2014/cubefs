@@ -25,6 +25,7 @@ import (
 // Keys in the request
 const (
 	addrKey                 = "addr"
+	RocksdbDirKey           = "rocksdbDir"
 	diskPathKey             = "disk"
 	nameKey                 = "name"
 	idKey                   = "id"
@@ -569,11 +570,12 @@ const (
 	PlanTaskStop  = "stop"
 	PlanTaskDone  = "done"
 
-	ManualPlan  = "manual"
-	AutoPlan    = "auto"
-	OfflinePlan = "offline"
-	ModifyStore = "modifyStoreMode"
-	AddLearner  = "addLearner"
+	ManualPlan      = "manual"
+	AutoPlan        = "auto"
+	OfflinePlan     = "offline"
+	DecommissionDir = "decommissionDir"
+	ModifyStore     = "modifyStoreMode"
+	AddLearner      = "addLearner"
 
 	CheckMetaLeaderRetry    = 10
 	CheckMetaLeaderInterval = 30

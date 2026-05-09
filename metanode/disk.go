@@ -15,6 +15,7 @@
 package metanode
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,18 +26,22 @@ import (
 )
 
 const (
-	UpdateDiskSpaceInterval = 10 * time.Second
-	CheckDiskStatusInterval = 1 * time.Minute
+	UpdateDiskSpaceInterval    = 10 * time.Second
+	CheckDiskStatusInterval    = 1 * time.Minute
+	CheckRocksdbStatusInterval = 10 * time.Minute
 )
 
 // Compute the disk usage
 func (m *MetaNode) startScheduleToUpdateSpaceInfo() {
+	m.CheckRocksdbStatus()
 	go func() {
 		updateSpaceInfoTicker := time.NewTicker(UpdateDiskSpaceInterval)
 		checkStatusTicker := time.NewTicker(CheckDiskStatusInterval)
+		checkRocksdbStatusTicker := time.NewTicker(CheckRocksdbStatusInterval)
 		defer func() {
 			updateSpaceInfoTicker.Stop()
 			checkStatusTicker.Stop()
+			checkRocksdbStatusTicker.Stop()
 		}()
 		for {
 			select {
@@ -55,6 +60,8 @@ func (m *MetaNode) startScheduleToUpdateSpaceInfo() {
 				for _, d := range m.disks {
 					d.UpdateDiskTick()
 				}
+			case <-checkRocksdbStatusTicker.C:
+				m.CheckRocksdbStatus()
 			}
 		}
 	}()
@@ -103,6 +110,7 @@ func (m *MetaNode) addDisk(path string, isRocksDBDisk bool, reservedSpace uint64
 }
 
 func (m *MetaNode) startDiskStat() error {
+	m.diskStopCh = make(chan struct{})
 	m.disks = make(map[string]*diskmon.FsCapMon)
 	foundRootDir := false
 	for _, rocksDir := range m.rocksDirs {
@@ -150,7 +158,48 @@ func (m *MetaNode) getRocksDBDiskStat() []*proto.MetaNodeRocksdbInfo {
 			UsageRatio:     ratio,
 			Status:         d.Status,
 			PartitionCount: count,
+			KeyNum:         m.getRocksdbKeyNum(d.Path),
 		})
 	}
 	return disks
+}
+
+func (m *MetaNode) CheckRocksdbStatus() {
+	for _, dbPath := range m.rocksDirs {
+		db, err := m.rocksdbManager.OpenRocksdb(dbPath, 0)
+		if err != nil {
+			continue
+		}
+
+		numStr, err := db.GetProperty("rocksdb.estimate-num-keys")
+		if err != nil {
+			log.LogErrorf("[CheckRocksdbStatus] failed to get estimate num keys on disk(%v), err(%v)", dbPath, err)
+			m.rocksdbManager.CloseRocksdb(db)
+			continue
+		}
+		num, err := strconv.ParseUint(numStr, 10, 64)
+		if err != nil {
+			log.LogErrorf("[CheckRocksdbStatus] failed to parse estimate num keys on disk(%v), err(%v)", dbPath, err)
+			m.rocksdbManager.CloseRocksdb(db)
+			continue
+		}
+		if disk, ok := m.disks[dbPath]; ok {
+			m.rocksdbKeyNums.Store(dbPath, num)
+			overLimit := m.rocksdbKeyNumMax > 0 && num > m.rocksdbKeyNumMax
+			_ = m.rocksdbManager.SetForbidden(dbPath, overLimit || disk.Status != diskmon.ReadWrite)
+		}
+		m.rocksdbManager.CloseRocksdb(db)
+	}
+}
+
+func (m *MetaNode) getRocksdbKeyNum(dbPath string) uint64 {
+	value, ok := m.rocksdbKeyNums.Load(dbPath)
+	if !ok {
+		return 0
+	}
+	num, ok := value.(uint64)
+	if !ok {
+		return 0
+	}
+	return num
 }

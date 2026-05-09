@@ -246,7 +246,8 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 			case proto.StoreModeRocksDb:
 				for _, stat := range diskStat {
 					if stat.Path == mConf.RocksDBDir &&
-						stat.UsageRatio >= 0.8 {
+						(stat.UsageRatio >= m.rocksDBDiskUsageThreshold ||
+							(m.metaNode.rocksdbKeyNumMax > 0 && stat.KeyNum >= m.metaNode.rocksdbKeyNumMax)) {
 						mpr.Status = proto.ReadOnly
 					}
 				}
@@ -267,6 +268,8 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 		resp.ZoneName = m.zoneName
 		resp.ReceivedForbidWriteOpOfProtoVer0 = m.metaNode.nodeForbidWriteOpOfProtoVer0
 		resp.RocksDBDiskInfo = diskStat
+		resp.RocksDBKeyNumMax = m.metaNode.rocksdbKeyNumMax
+		resp.RocksdbDiskThreshold = float32(m.rocksDBDiskUsageThreshold)
 		resp.Status = proto.TaskSucceeds
 	end:
 		adminTask.Request = nil

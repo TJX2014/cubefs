@@ -40,12 +40,16 @@ type RocksdbManager interface {
 	AttachPartition(dbPath string) (err error)
 	DetachPartition(dbPath string) (err error)
 	GetPartitionCount(dbPath string) (count int, err error)
+	UpdateConfig(dbPath string, config map[string]string) error
+	GetConfig(dbPath string) (map[string]string, error)
+	SetForbidden(dbPath string, forbidden bool) error
 }
 
 type RocksdbHandle struct {
 	db         *RocksdbOperator
 	rc         uint64
 	partitions int
+	Forbidden  bool
 }
 
 type PerDiskRocksdbManager struct {
@@ -56,6 +60,7 @@ type PerDiskRocksdbManager struct {
 	blockCacheSize      uint64
 	mutex               sync.Mutex
 	dbs                 map[string]*RocksdbHandle
+	configs             map[string]map[string]string
 }
 
 func (r *PerDiskRocksdbManager) Register(dbPath string) (err error) {
@@ -70,6 +75,7 @@ func (r *PerDiskRocksdbManager) Register(dbPath string) (err error) {
 		db: NewRocksdb(),
 		rc: 0,
 	}
+	r.configs[dbPath] = make(map[string]string)
 	return
 }
 
@@ -86,6 +92,7 @@ func (r *PerDiskRocksdbManager) Unregister(dbPath string) (err error) {
 		return
 	}
 	delete(r.dbs, dbPath)
+	delete(r.configs, dbPath)
 	return
 }
 
@@ -105,6 +112,13 @@ func (r *PerDiskRocksdbManager) OpenRocksdb(dbPath string, metaPartitionId uint6
 		if err != nil {
 			handle.rc -= 1
 			return
+		}
+		if config := r.configs[dbPath]; len(config) > 0 {
+			if err = handle.db.SetOptions(config); err != nil {
+				_ = handle.db.CloseDb()
+				handle.rc -= 1
+				return
+			}
 		}
 	}
 	db = handle.db
@@ -136,6 +150,9 @@ func (r *PerDiskRocksdbManager) SelectRocksdbDisk(usableFactor float64) (disk st
 	defer r.mutex.Unlock()
 	stats := make([]diskmon.DiskStat, 0)
 	for dir, handle := range r.dbs {
+		if handle.Forbidden {
+			continue
+		}
 		var stat diskmon.DiskStat
 		stat, err = diskmon.NewDiskStat(dir)
 		if err != nil {
@@ -154,6 +171,17 @@ func (r *PerDiskRocksdbManager) SelectRocksdbDisk(usableFactor float64) (disk st
 	handle := r.dbs[disk]
 	handle.partitions += 1
 	return
+}
+
+func (r *PerDiskRocksdbManager) SetForbidden(dbPath string, forbidden bool) error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	handle, ok := r.dbs[dbPath]
+	if !ok {
+		return ErrUnregisteredRocksdbPath
+	}
+	handle.Forbidden = forbidden
+	return nil
 }
 
 func (r *PerDiskRocksdbManager) AttachPartition(dbPath string) (err error) {
@@ -192,6 +220,40 @@ func (r *PerDiskRocksdbManager) GetPartitionCount(dbPath string) (count int, err
 	}
 	count = handle.partitions
 	return
+}
+
+func (r *PerDiskRocksdbManager) UpdateConfig(dbPath string, config map[string]string) error {
+	db, err := r.OpenRocksdb(dbPath, 0)
+	if err != nil {
+		return err
+	}
+	defer r.CloseRocksdb(db)
+
+	if err = db.SetOptions(config); err != nil {
+		log.LogErrorf("[UpdateConfig] failed to set rocksdb options, err(%v)", err)
+		return err
+	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	pathConfig, ok := r.configs[dbPath]
+	if !ok {
+		return ErrUnregisteredRocksdbPath
+	}
+	for key, val := range config {
+		pathConfig[key] = val
+	}
+	return nil
+}
+
+func (r *PerDiskRocksdbManager) GetConfig(dbPath string) (map[string]string, error) {
+	db, err := r.OpenRocksdb(dbPath, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer r.CloseRocksdb(db)
+
+	return db.GetOptions(), nil
 }
 
 var _ RocksdbManager = &PerDiskRocksdbManager{}
@@ -249,6 +311,14 @@ func (r *PerPartitionRocksdbManager) GetPartitionCount(dbPath string) (count int
 	return
 }
 
+func (r *PerPartitionRocksdbManager) UpdateConfig(dbPath string, config map[string]string) error {
+	return fmt.Errorf("partition rocksdb manager does not support update config")
+}
+
+func (r *PerPartitionRocksdbManager) GetConfig(dbPath string) (map[string]string, error) {
+	return nil, fmt.Errorf("partition rocksdb manager does not support get config")
+}
+
 func (r *PerPartitionRocksdbManager) OpenRocksdb(dbPath string, metaPartitionId uint64) (db *RocksdbOperator, err error) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
@@ -304,6 +374,9 @@ func (r *PerPartitionRocksdbManager) SelectRocksdbDisk(usableFactor float64) (di
 	defer r.mutex.Unlock()
 	stats := make([]diskmon.DiskStat, 0)
 	for dir := range r.dbs {
+		if forbidden, ok := r.dbs[dir].(bool); ok && forbidden {
+			continue
+		}
 		var stat diskmon.DiskStat
 		stat, err = diskmon.NewDiskStat(dir)
 		if err != nil {
@@ -323,6 +396,17 @@ func (r *PerPartitionRocksdbManager) SelectRocksdbDisk(usableFactor float64) (di
 	return
 }
 
+func (r *PerPartitionRocksdbManager) SetForbidden(dbPath string, forbidden bool) error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	_, ok := r.dbs[dbPath]
+	if !ok {
+		return ErrUnregisteredRocksdbPath
+	}
+	r.dbs[dbPath] = forbidden
+	return nil
+}
+
 var _ RocksdbManager = &PerPartitionRocksdbManager{}
 
 func NewPerDiskRocksdbManager(writeBufferSize int, writeBufferNum int, minWriteBuffToMerge int, maxSubCompactions int, blockCacheSize uint64) (p RocksdbManager) {
@@ -333,6 +417,7 @@ func NewPerDiskRocksdbManager(writeBufferSize int, writeBufferNum int, minWriteB
 		maxSubCompactions:   maxSubCompactions,
 		blockCacheSize:      blockCacheSize,
 		dbs:                 make(map[string]*RocksdbHandle),
+		configs:             make(map[string]map[string]string),
 	}
 	return
 }
