@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
@@ -40,6 +41,19 @@ type MigrateResult struct {
 	Target MetaReplicaInfo `json:"target"`
 }
 
+type MetaPartitionPlanUserParams struct {
+	Name               string          `json:"name"`
+	StartID            uint64          `json:"startId"`
+	EndID              uint64          `json:"endId"`
+	Mode               proto.StoreMode `json:"mode"`
+	Count              int             `json:"count"`
+	AutoPromoteLearner bool            `json:"autoPromoteLearner"`
+	SelectType         int             `json:"selectType"` // 0: not set. 1: zone name. 2: node set id. 3: node address list.
+	ZoneName           string          `json:"zoneName"`
+	NodeSetID          uint64          `json:"nodesetId"`
+	SelectTag          string          `json:"selectTag"`
+}
+
 func (m *Server) getMetaPartitionEmptyStatus(w http.ResponseWriter, r *http.Request) {
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminMetaPartitionEmptyStatus))
 	defer func() {
@@ -54,7 +68,7 @@ func (m *Server) getMetaPartitionEmptyStatus(w http.ResponseWriter, r *http.Requ
 			continue
 		}
 		// skip the deleted volume.
-		if vol.Status == proto.VolStatusMarkDelete {
+		if vol.isUnavailable() {
 			continue
 		}
 		volStatus := proto.VolEmptyMpStats{
@@ -100,8 +114,8 @@ func (m *Server) freezeEmptyMetaPartition(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if vol.Status == proto.VolStatusMarkDelete {
-		sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("volume (%s) is deleted already.", name)))
+	if vol.isUnavailable() {
+		sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("volume (%s) is deleted or init failed already.", name)))
 		return
 	}
 
@@ -207,8 +221,8 @@ func (m *Server) cleanEmptyMetaPartition(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if vol.Status == proto.VolStatusMarkDelete {
-		sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("volume (%s) is deleted already.", name)))
+	if vol.isUnavailable() {
+		sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("volume (%s) is deleted or init failed already.", name)))
 		return
 	}
 
@@ -346,6 +360,8 @@ func (m *Server) migrateMetaPartitionHandler(w http.ResponseWriter, r *http.Requ
 		mpid       uint64
 		err        error
 		mp         *MetaPartition
+		modeInt    int
+		mode       proto.StoreMode
 	)
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.MigrateMetaPartition))
 	defer func() {
@@ -353,6 +369,11 @@ func (m *Server) migrateMetaPartitionHandler(w http.ResponseWriter, r *http.Requ
 	}()
 
 	srcAddr, targetAddr, mpid, err = parseMigratePartitionParam(r)
+	if err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+	modeInt, err = extractStoreMode(r)
 	if err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
@@ -365,19 +386,30 @@ func (m *Server) migrateMetaPartitionHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	if !targetNode.IsWriteAble() || !targetNode.PartitionCntLimited() {
-		err = fmt.Errorf("[%s] is not writable, can't used as target addr for migrate", targetAddr)
+		err = fmt.Errorf("[%s] is not writable, can't be used as target addr for migrate", targetAddr)
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
 
 	mp, err = m.cluster.getMetaPartitionByID(mpid)
 	if err != nil {
-		err = fmt.Errorf("Failed to get meta partition (%d)", mpid)
+		err = fmt.Errorf("failed to get meta partition (%d)", mpid)
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
 
-	if err = m.cluster.migrateMetaPartition(srcAddr, targetAddr, mp); err != nil {
+	if modeInt == 0 {
+		mode, err = m.cluster.getMetaPartitionStoreMode(mp, srcAddr)
+		if err != nil {
+			err = fmt.Errorf("getMetaPartitionStoreMode mp ID(%d) err: %s", mpid, err.Error())
+			sendErrReply(w, r, newErrHTTPReply(err))
+			return
+		}
+	} else {
+		mode = proto.StoreMode(modeInt)
+	}
+
+	if err = m.cluster.migrateMetaPartition(srcAddr, targetAddr, mp, mode); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
@@ -394,11 +426,16 @@ func (m *Server) createMetaNodeBalancePlan(w http.ResponseWriter, r *http.Reques
 		doStatAndMetric(proto.CreateMetaNodeBalanceTask, metric, err, nil)
 	}()
 
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
+
 	var plan *proto.ClusterPlan
 	// search the raft storage. Only store one plan
 	plan, err = m.cluster.loadBalanceTask()
 	if err == nil && plan != nil {
-		err = fmt.Errorf("There is a meta partition task plan already. Please remove it before create a new one.")
+		err = fmt.Errorf("there is a meta partition task plan already. Please remove it before create a new one")
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error(), Data: plan})
 		return
 	}
@@ -456,6 +493,11 @@ func (m *Server) runMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) 
 		doStatAndMetric(proto.RunMetaNodeBalanceTask, metric, err, nil)
 	}()
 
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
+
 	err = m.cluster.RunMetaPartitionBalanceTask()
 	if err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
@@ -468,13 +510,21 @@ func (m *Server) runMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) 
 }
 
 func (m *Server) stopMetaNodeBalancePlan(w http.ResponseWriter, r *http.Request) {
-	var err error
+	var (
+		err   error
+		force bool
+		value string
+	)
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.StopMetaNodeBalanceTask))
 	defer func() {
 		doStatAndMetric(proto.StopMetaNodeBalanceTask, metric, err, nil)
 	}()
 
-	err = m.cluster.StopMetaPartitionBalanceTask()
+	if value = r.FormValue(forceKey); value != "" {
+		force, _ = strconv.ParseBool(value)
+	}
+
+	err = m.cluster.StopMetaPartitionBalanceTask(force)
 	if err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
 		return
@@ -491,6 +541,11 @@ func (m *Server) deleteMetaNodeBalancePlan(w http.ResponseWriter, r *http.Reques
 	defer func() {
 		doStatAndMetric(proto.DeleteMetaNodeBalanceTask, metric, err, nil)
 	}()
+
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
 
 	err = m.cluster.DeleteMetaPartitionBalanceTask()
 	if err != nil {
@@ -517,6 +572,11 @@ func (m *Server) offlineMetaNode(w http.ResponseWriter, r *http.Request) {
 		AuditLog(r, proto.OfflineMetaNode, rstMsg, err)
 	}()
 
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
+
 	if offLineAddr, err = parseAndExtractNodeAddr(r); err != nil {
 		log.LogErrorf("parse node addr failed, err: %v", err)
 		sendErrReply(w, r, newErrHTTPReply(proto.ErrParamError))
@@ -529,10 +589,13 @@ func (m *Server) offlineMetaNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	oldRdOnly := metaNode.RdOnly
-	if !oldRdOnly {
+	oldRocksdbRdOnly := metaNode.RocksdbRdOnly
+	if !oldRdOnly || !oldRocksdbRdOnly {
 		metaNode.RdOnly = true
+		metaNode.RocksdbRdOnly = true
 		if err = m.cluster.syncUpdateMetaNode(metaNode); err != nil {
 			metaNode.RdOnly = oldRdOnly
+			metaNode.RocksdbRdOnly = oldRocksdbRdOnly
 			log.LogErrorf("syncUpdateMetaNode(%s) err: %s", offLineAddr, err.Error())
 			sendErrReply(w, r, newErrHTTPReply(proto.ErrInternalError))
 			return
@@ -566,7 +629,7 @@ func (m *Server) offlineMetaNode(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			log.LogWarnf("one balance task exist. clear it before kick out(%s)", offLineAddr)
-			err = fmt.Errorf("There is a meta partition task plan. Clear it before kick out new metanode")
+			err = fmt.Errorf("there is a meta partition task plan. Clear it before kick out new metanode")
 			sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error(), Data: plan})
 			return
 		}
@@ -591,6 +654,7 @@ func (m *Server) offlineMetaNode(w http.ResponseWriter, r *http.Request) {
 
 	plan.Type = OfflinePlan
 	plan.Status = PlanTaskRun
+	plan.StartTime = time.Now()
 
 	// Save into raft storage.
 	err = m.cluster.syncAddBalanceTask(plan)
@@ -602,4 +666,295 @@ func (m *Server) offlineMetaNode(w http.ResponseWriter, r *http.Request) {
 
 	rstMsg = fmt.Sprintf("Offline metanode %s at background successfully", offLineAddr)
 	sendOkReply(w, r, newSuccessHTTPReply(rstMsg))
+}
+
+// parseMetaPartitionPlanUserParams parses and validates parameters for modifying meta partition store mode
+func parseMetaPartitionPlanUserParams(r *http.Request) (param *MetaPartitionPlanUserParams, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	param = &MetaPartitionPlanUserParams{}
+
+	param.Name = r.FormValue(nameKey)
+	if param.Name != "" {
+		if !volNameRegexp.MatchString(param.Name) {
+			err = proto.ErrVolNameRegExpNotMatch
+			return
+		}
+	}
+
+	// Extract partition ID range
+	startIDStr := r.FormValue(StartIdKey)
+	if startIDStr != "" {
+		if param.StartID, err = strconv.ParseUint(startIDStr, 10, 64); err != nil {
+			err = fmt.Errorf("invalid start id")
+			return
+		}
+	}
+
+	endIDStr := r.FormValue(EndIdKey)
+	if endIDStr != "" {
+		if param.EndID, err = strconv.ParseUint(endIDStr, 10, 64); err != nil {
+			err = fmt.Errorf("invalid end id")
+			return
+		}
+	}
+
+	if param.StartID > param.EndID && param.EndID != 0 {
+		err = fmt.Errorf("start id cannot be greater than end id")
+		return
+	}
+
+	// Extract store mode
+	var modeInt int
+	modeInt, err = extractStoreMode(r)
+	if err != nil {
+		return
+	}
+	if modeInt != 0 {
+		param.Mode = proto.StoreMode(modeInt)
+		if param.Mode != proto.StoreModeMem && param.Mode != proto.StoreModeRocksDb {
+			err = fmt.Errorf("invalid store mode")
+			return
+		}
+	} else {
+		param.Mode = proto.StoreModeRocksDb // Default to migrate to RocksDB mode
+	}
+
+	param.Count = 0
+	countStr := r.FormValue(countKey)
+	if countStr != "" {
+		if param.Count, err = strconv.Atoi(countStr); err != nil {
+			err = fmt.Errorf("invalid count")
+			return
+		}
+	}
+	if param.Count <= 0 || param.Count > 3 {
+		// default to 1
+		param.Count = 1
+	}
+
+	var promote bool
+	if value := r.FormValue(PromoteKey); value != "" {
+		promote, err = strconv.ParseBool(value)
+		if err != nil {
+			err = fmt.Errorf("invalid promote")
+			return
+		}
+		param.AutoPromoteLearner = promote
+	}
+
+	selectTypeStr := r.FormValue(SelectTypeKey)
+	if selectTypeStr != "" {
+		var selectType int
+		selectType, err = strconv.Atoi(selectTypeStr)
+		if err != nil {
+			err = fmt.Errorf("invalid select type")
+			return
+		}
+		param.SelectType = selectType
+	}
+
+	param.ZoneName = r.FormValue(zoneNameKey)
+	if param.SelectType == SelectTypeZoneName && param.ZoneName == "" {
+		err = fmt.Errorf("zone name is required when select type is 1")
+		return
+	}
+
+	nodeSetIdStr := r.FormValue(nodesetIdKey)
+	if nodeSetIdStr != "" {
+		if param.NodeSetID, err = strconv.ParseUint(nodeSetIdStr, 10, 64); err != nil {
+			err = fmt.Errorf("invalid node set id")
+			return
+		}
+	}
+
+	if param.SelectType == SelectTypeNodeSetId && param.NodeSetID == 0 {
+		err = fmt.Errorf("node set id is required when select type is 2")
+		return
+	}
+
+	param.SelectTag = r.FormValue(SelectTagKey)
+
+	if param.SelectType == SelectTypeNodeAddrs && param.SelectTag == "" {
+		err = fmt.Errorf("select tag is required when select type is 3")
+		return
+	}
+
+	return
+}
+
+func (m *Server) batchMigrateMetaPartition(w http.ResponseWriter, r *http.Request) {
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminBatchMigrateMp))
+	var err error
+	defer func() {
+		doStatAndMetric(proto.AdminBatchMigrateMp, metric, err, nil)
+	}()
+
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
+
+	// search the raft storage. Only store one plan
+	_, err = m.cluster.loadBalanceTask()
+	if err == nil {
+		err = m.cluster.DeleteMetaPartitionBalanceTask()
+		if err != nil {
+			log.LogErrorf("failed to delete meta partition balance task: %s", err.Error())
+			sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+			return
+		}
+	} else if err != proto.ErrNoMpMigratePlan {
+		log.LogErrorf("failed to load meta partition balance task: %s", err.Error())
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+		return
+	}
+
+	param, err := parseMetaPartitionPlanUserParams(r)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	plan, err := m.cluster.CreateMetaPartitionAddLearnerPlan(param)
+	if err != nil {
+		log.LogErrorf("addMetaPartitionLearner failed param:[%+v] err: %s", param, err.Error())
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error(), Data: plan})
+		return
+	}
+
+	msg := fmt.Sprintf("volume(%s) start(%d) end(%d) mode(%d) count(%d) promote(%v) selectType(%d) zone(%s) nodesetId(%d) selectTag(%s)",
+		param.Name, param.StartID, param.EndID, param.Mode, param.Count,
+		param.AutoPromoteLearner, param.SelectType, param.ZoneName, param.NodeSetID, param.SelectTag)
+	AuditLog(r, "batchMigrateMetaPartition", msg, nil)
+
+	sendOkReply(w, r, newSuccessHTTPReply(plan))
+}
+
+// promoteMetaPartitionLearner promotes all rocksdb + learner metapartitions to voters within [startID, endID].
+// Query/Form parameters:
+// - name: volume name (optional; empty means all volumes)
+// - startId: start mp id (optional; default 0)
+// - endId: end mp id (optional; default 0)
+func (m *Server) batchPromoteMpLearner(w http.ResponseWriter, r *http.Request) {
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminBatchPromoteMpLearner))
+	var err error
+	defer func() {
+		doStatAndMetric(proto.AdminBatchPromoteMpLearner, metric, err, nil)
+	}()
+
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
+
+	param, err := parseMetaPartitionPlanUserParams(r)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	// do promote
+	promotePlan, err := m.cluster.CreatePromoteLearnerPlan(param)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+		return
+	}
+
+	msg := fmt.Sprintf("create promote learner plan: vol(%s) start(%d) end(%d) total(%d)", param.Name, param.StartID, param.EndID, promotePlan.TotalNum)
+	AuditLog(r, "CreatePromoteLearnerPlan", msg, nil)
+	sendOkReply(w, r, newSuccessHTTPReply(promotePlan))
+}
+
+func (m *Server) getPromoteMpLearnerPlan(w http.ResponseWriter, r *http.Request) {
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminGetPromoteMpLearnerPlan))
+	var err error
+	defer func() {
+		doStatAndMetric(proto.AdminGetPromoteMpLearnerPlan, metric, err, nil)
+	}()
+
+	plan, err := m.cluster.loadPromoteLearnerPlan()
+	if err != nil && err != proto.ErrNoPromoteLearnerPlan {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+		return
+	}
+
+	if plan == nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: "no promote learner plan"})
+		return
+	}
+
+	sendOkReply(w, r, newSuccessHTTPReply(plan))
+}
+
+func (m *Server) calcMetaPartitionMd5Sum(w http.ResponseWriter, r *http.Request) {
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminCalcMetaPartitionMd5Sum))
+	var err error
+	defer func() {
+		doStatAndMetric(proto.AdminCalcMetaPartitionMd5Sum, metric, err, nil)
+	}()
+
+	param, err := parseMetaPartitionPlanUserParams(r)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	if m.cluster.IsClusterPlanNotIdle() {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: m.cluster.GetClusterPlanStatusMsg()})
+		return
+	}
+
+	plan, err := m.cluster.loadCheckSumPlan()
+	if err != nil && err != proto.ErrNoCheckSumPlan {
+		log.LogErrorf("loadCheckSumPlan failed: %s", err.Error())
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+		return
+	}
+
+	if plan != nil {
+		if plan.Status == PlanTaskRun {
+			sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: "There is a check sum plan running, please wait for it to finish"})
+			return
+		}
+		err = m.cluster.syncDeleteCheckSumPlan()
+		if err != nil {
+			log.LogErrorf("syncDeleteCheckSumPlan failed: %s", err.Error())
+			sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+			return
+		}
+	}
+
+	plan, err = m.cluster.CreateAndRunCheckSumPlan(param)
+	if err != nil {
+		log.LogErrorf("CreateAndRunCheckSumPlan failed: %s", err.Error())
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+		return
+	}
+
+	sendOkReply(w, r, newSuccessHTTPReply(plan))
+}
+
+func (m *Server) getMd5SumResult(w http.ResponseWriter, r *http.Request) {
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminGetMd5SumResult))
+	var err error
+	defer func() {
+		doStatAndMetric(proto.AdminGetMd5SumResult, metric, err, nil)
+	}()
+
+	plan, err := m.cluster.loadCheckSumPlan()
+	if err != nil {
+		log.LogErrorf("loadCheckSumPlan failed: %s", err.Error())
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: err.Error()})
+		return
+	}
+
+	if plan == nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeInternalError, Msg: "no check sum plan"})
+		return
+	}
+
+	sendOkReply(w, r, newSuccessHTTPReply(plan))
 }

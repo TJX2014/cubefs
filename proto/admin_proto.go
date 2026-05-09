@@ -46,6 +46,7 @@ const (
 	AdminGetDataPartition                                  = "/dataPartition/get"
 	AdminLoadDataPartition                                 = "/dataPartition/load"
 	AdminCreateDataPartition                               = "/dataPartition/create"
+	AdminCreatePreLoadDataPartition                        = "/dataPartition/createPreLoad"
 	AdminDecommissionDataPartition                         = "/dataPartition/decommission"
 	AdminDiagnoseDataPartition                             = "/dataPartition/diagnose"
 	AdminResetDataPartitionDecommissionStatus              = "/dataPartition/resetDecommissionStatus"
@@ -110,6 +111,7 @@ const (
 	AdminQueryDecommissionToken            = "/admin/queryDecommissionToken"
 	AdminQueryDiskDecommissionInfoStat     = "/admin/queryDiskDecommissionInfoStat"
 	AdminQueryDataNodeDecommissionInfoStat = "/admin/queryDataNodeDecommissionInfoStat"
+	AdminQueryDpDecommissionStatus         = "/admin/queryDpDecommissionStatus"
 	AdminSetFileStats                      = "/admin/setFileStats"
 	AdminGetFileStats                      = "/admin/getFileStats"
 	AdminGetClusterValue                   = "/admin/getClusterValue"
@@ -127,6 +129,11 @@ const (
 	AdminUpdateDecommissionDiskLimit = "/admin/updateDecommissionDiskLimit"
 	AdminEnableAutoDecommissionDisk  = "/admin/enableAutoDecommissionDisk"
 	AdminQueryAutoDecommissionDisk   = "/admin/queryAutoDecommissionDisk"
+
+	AdminCancelDpDistributionOptimization          = "/admin/cancelDpDistributionOptimization"
+	AdminQueryDistributionOptimizationStatus       = "/admin/queryDistributionOptimizationStatus"
+	AdminSetDistributionOptimizationEnable         = "/admin/setDistributionOptimizationEnable"
+	AdminExecuteDistributionOptimizationMigrations = "/admin/executeDistributionOptimizationMigrations"
 	// graphql master api
 	AdminClusterAPI               = "/api/cluster"
 	AdminUserAPI                  = "/api/user"
@@ -231,7 +238,14 @@ const (
 	AdminMetaPartitionGetCleanTask     = "/metaPartition/getCleanTask"
 	AdminAddMetaReplica                = "/metaReplica/add"
 	AdminDeleteMetaReplica             = "/metaReplica/delete"
+	AdminAddMetaPartitionLearner       = "/metaPartition/addLearner"
+	AdminPromoteMetaReplica            = "/metaReplica/promote"
 	AdminPutDataPartitions             = "/dataPartitions/set"
+	AdminBatchMigrateMp                = "/metaPartition/batchMigrate"
+	AdminBatchPromoteMpLearner         = "/metaPartition/batchPromoteLearner"
+	AdminGetPromoteMpLearnerPlan       = "/metaPartition/getPromoteLearnerPlan"
+	AdminCalcMetaPartitionMd5Sum       = "/metaPartition/calcMd5Sum"
+	AdminGetMd5SumResult               = "/metaPartition/getMd5SumResult"
 
 	// admin multi version snapshot
 	AdminCreateVersion     = "/multiVer/create"
@@ -419,6 +433,8 @@ var GApiInfo map[string]string = map[string]string{
 	"adminbalancemetapartitionleader": AdminBalanceMetaPartitionLeader,
 	"adminaddmetareplica":             AdminAddMetaReplica,
 	"admindeletemetareplica":          AdminDeleteMetaReplica,
+	"adminaddmetapartitionlearner":    AdminAddMetaPartitionLearner,
+	"adminpromotemetareplica":         AdminPromoteMetaReplica,
 	"getmetanodetaskresponse":         GetMetaNodeTaskResponse,
 	"getdatanodetaskresponse":         GetDataNodeTaskResponse,
 	"gettopologyview":                 GetTopologyView,
@@ -435,10 +451,15 @@ var GApiInfo map[string]string = map[string]string{
 	"usertransfervol":                 UserTransferVol,
 	"userlist":                        UserList,
 	"usersofvol":                      UsersOfVol,
+	"adminexecutedistributionoptimizationmigrations": AdminExecuteDistributionOptimizationMigrations,
+	"admincanceldpdistributionoptimization":          AdminCancelDpDistributionOptimization,
+	"adminquerydistributionoptimizationstatus":       AdminQueryDistributionOptimizationStatus,
+	"adminsetdistributionoptimizationenable":         AdminSetDistributionOptimizationEnable,
 }
 
 const (
 	MetaFollowerReadKey    = "metaFollowerRead"
+	MetaNearReadKey        = "metaNearRead"
 	MaximallyReadKey       = "maximallyRead"
 	LeaderRetryTimeoutKey  = "leaderRetryTimeout"
 	VolEnableDirectRead    = "directRead"
@@ -461,6 +482,10 @@ const (
 const (
 	CfgHttpPoolSize     = "httpPoolSize"
 	defaultHttpPoolSize = 128
+)
+
+const (
+	MaxMetaPartitionLearnerNum = 5
 )
 
 type HttpCfg struct {
@@ -706,10 +731,34 @@ type RemoveDataPartitionRaftMemberRequest struct {
 	AutoRemove      bool
 }
 
-// AddMetaPartitionRaftMemberRequest defines the request of add raftMember a meta partition.
+// MemberOperationType defines the type of member operation
+type MemberOperationType uint8
+
+const (
+	// OpTypeAddRaftMember adds a normal raft member (voter)
+	OpTypeAddRaftMember MemberOperationType = 0
+	// OpTypeAddLearner adds a learner node
+	OpTypeAddLearner MemberOperationType = 1
+	// OpTypePromoteLearner promotes a learner to voter
+	OpTypePromoteLearner MemberOperationType = 2
+)
+
+// AddMetaPartitionRaftMemberRequest defines the request of add raftMember/learner or promote learner in a meta partition.
 type AddMetaPartitionRaftMemberRequest struct {
 	PartitionId uint64
 	AddPeer     Peer
+	// OpType specifies the operation type: 0=AddRaftMember, 1=AddLearner, 2=PromoteLearner
+	// Default is 0 (AddRaftMember) for backward compatibility
+	OpType MemberOperationType `json:"opType,omitempty"`
+}
+
+func (r *AddMetaPartitionRaftMemberRequest) String() string {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Sprintf("AddMetaPartitionRaftMemberRequest: %v", err.Error())
+	}
+
+	return string(data)
 }
 
 // RemoveMetaPartitionRaftMemberRequest defines the request of add raftMember a meta partition.
@@ -977,6 +1026,8 @@ type MetaPartitionReport struct {
 	StatByMigrateStorageClass []*StatOfStorageClass
 	LocalPeers                []Peer
 	ReadOnlyReasons           uint32
+	StoreMode                 StoreMode
+	IsLearner                 bool
 }
 
 // MetaNodeHeartbeatResponse defines the response to the meta node heartbeat request.
@@ -991,6 +1042,8 @@ type MetaNodeHeartbeatResponse struct {
 	Result                           string
 	CpuUtil                          float64 `json:"cpuUtil"`
 	ReceivedForbidWriteOpOfProtoVer0 bool
+	RocksDBDiskInfo                  []*MetaNodeRocksdbInfo
+	RocksDBKeyNumMax                 uint64
 }
 
 // LcNodeHeartbeatResponse defines the response to the lc node heartbeat.
@@ -1121,6 +1174,8 @@ type MetaPartitionLoadResponse struct {
 	InodeCount  uint64
 	Addr        string
 	RaftInfo    RaftInfo
+	Md5ApplyId  uint64
+	Md5Sum      string
 }
 
 // DataPartitionResponse defines the response from a data node to the master that is related to a data partition.
@@ -1173,6 +1228,9 @@ type MetaPartitionView struct {
 	Status             int8
 	Freeze             int8
 	LastDelReplicaTime int64
+	StoreMode          StoreMode
+	MemCount           uint8
+	RocksCount         uint8
 }
 
 type DataNodeDisksRequest struct{}
@@ -1345,6 +1403,7 @@ type SimpleVolView struct {
 	DpOfHDDCnt              int
 	FollowerRead            bool
 	MetaFollowerRead        bool
+	MetaNearRead            bool
 	DirectRead              bool
 	IgnoreTinyRecover       bool
 	MaximallyRead           bool
@@ -1408,6 +1467,9 @@ type SimpleVolView struct {
 	QosInfo QosSimpleInfo // qos status
 
 	RemoteCacheRemoveDupReq bool // TODO: using it in metanode, origin was named EnableRemoveDupReq
+	DefaultStoreMode        StoreMode
+	RocksdbMpCount          uint64
+	MemoryMpCount           uint64
 }
 
 type NodeSetInfo struct {
@@ -1566,6 +1628,12 @@ const (
 	QueryDecommission // used for querying decommission progress for ManualDecommission and AutoDecommission
 	AutoAddReplica
 	ManualAddReplica
+	DistributionOptimization
+)
+
+const (
+	SelectType_Normal uint32 = iota
+	SelectType_DistributionOptimization
 )
 
 type BackupDataPartitionInfo struct {
@@ -1770,3 +1838,68 @@ const (
 	FreezingMetaPartition   = 1
 	FreezedMetaPartition    = 2
 )
+
+const (
+	DefaultRack = "default"
+)
+
+type MetaNodeRocksdbInfo struct {
+	Path           string
+	Total          uint64
+	Used           uint64
+	UsageRatio     float64
+	Status         int8
+	PartitionCount int
+	KeyNum         uint64
+}
+
+type RackAwareLevel uint8
+
+const (
+	RackAwareNone RackAwareLevel = iota
+	RackAwareWeak
+	RackAwareStrong
+)
+
+func (l RackAwareLevel) String() string {
+	switch l {
+	case RackAwareNone:
+		return "nolimit"
+	case RackAwareWeak:
+		return "weak"
+	case RackAwareStrong:
+		return "strong"
+	default:
+		return "unknown"
+	}
+}
+
+// RecoverState represents the learner recovery state
+type RecoverState int
+
+const (
+	RecoverStateInit       RecoverState = 0 // Initial state
+	RecoverStateRecovering RecoverState = 1 // Recovering (IsRecover=true)
+	RecoverStateFailed     RecoverState = 2 // Recovery failed
+)
+
+func (s RecoverState) String() string {
+	switch s {
+	case RecoverStateInit:
+		return "Init"
+	case RecoverStateRecovering:
+		return "Recovering"
+	case RecoverStateFailed:
+		return "Failed"
+	default:
+		return "Unknown"
+	}
+}
+
+func (l RackAwareLevel) IsValid() bool {
+	return l >= RackAwareNone && l <= RackAwareStrong
+}
+
+type CalcMetaPartitionMd5SumRequest struct {
+	PartitionID uint64
+}

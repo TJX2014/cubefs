@@ -62,6 +62,7 @@ const (
 	akKey                                  = "ak"
 	keywordsKey                            = "keywords"
 	zoneNameKey                            = "zoneName"
+	rackKey                                = "rack" // 添加 rack 字段的 key
 	nodesetIdKey                           = "nodesetId"
 	crossZoneKey                           = "crossZone"
 	normalZonesFirstKey                    = "normalZonesFirst"
@@ -85,6 +86,7 @@ const (
 	rdOnlyKey                              = "rdOnly"
 	srcAddrKey                             = "srcAddr"
 	targetAddrKey                          = "targetAddr"
+	manualPromoteKey                       = "manualPromote"
 	forceKey                               = "force"
 	raftForceDelKey                        = "raftForceDel"
 	weightKey                              = "weight"
@@ -129,7 +131,6 @@ const (
 	ClientIDKey                            = "clientIDKey"
 	verSeqKey                              = "verSeq"
 	Periodic                               = "periodic"
-	DecommissionType                       = "decommissionType"
 	decommissionDiskLimit                  = "decommissionDiskLimit"
 	dpRepairBlockSizeKey                   = "dpRepairBlockSize"
 	markDiskBrokenThresholdKey             = "markDiskBrokenThreshold"
@@ -138,8 +139,14 @@ const (
 	autoDecommissionDiskIntervalKey        = "autoDecommissionDiskInterval"
 	autoDpMetaRepairKey                    = "autoDpMetaRepair"
 	autoDpMetaRepairParallelCntKey         = "autoDpMetaRepairParallelCnt"
+	enableMpDecommissionByLearnerKey       = "enableMpDecommissionByLearner"
+	autoDistributionOptimizationKey        = "autoDistributionOptimization"
+	distributionOptimizationConDpCntKey    = "distributionOptimizationConDpCnt"
+	distributionOptimizationThresholdKey   = "distributionOptimizationThreshold"
 	dpTimeoutKey                           = "dpTimeout"
 	mpTimeoutKey                           = "mpTimeout"
+	rackAwareLevelKey                      = "rackAware"
+	learnerRecoverTimeoutSecondsKey        = "learnerRecoverTimeoutSeconds"
 	ShowAll                                = "showAll"
 	trashIntervalKey                       = "trashInterval"
 	accessTimeIntervalKey                  = "accessTimeValidInterval"
@@ -155,6 +162,10 @@ const (
 	quotaClass                             = "quotaClass"
 	quotaOfClass                           = "quotaOfStorageClass"
 	dataMediaTypeKey                       = "dataMediaType"
+	dpLimitSsdBaseCountKey                 = "dpLimitSsdBaseCount"
+	dpLimitSsdFactorKey                    = "dpLimitSsdFactor"
+	dpLimitHddBaseCountKey                 = "dpLimitHddBaseCount"
+	dpLimitHddFactorKey                    = "dpLimitHddFactor"
 
 	remoteCacheEnable            = "remoteCacheEnable"
 	remoteCacheAutoPrepare       = "remoteCacheAutoPrepare"
@@ -167,6 +178,13 @@ const (
 	flashNodeTimeoutCount        = "flashNodeTimeoutCount"
 	remoteCacheSameZoneTimeout   = "remoteCacheSameZoneTimeout"
 	remoteCacheSameRegionTimeout = "remoteCacheSameRegionTimeout"
+
+	StoreModeKey  = "storeMode"
+	StartIdKey    = "start"
+	EndIdKey      = "end"
+	PromoteKey    = "promote"
+	SelectTypeKey = "selectType"
+	SelectTagKey  = "selectTag"
 )
 
 const (
@@ -201,63 +219,76 @@ const (
 )
 
 const (
-	defaultFaultDomainZoneCnt                     = 3
-	defaultNormalCrossZoneCnt                     = 3
-	defaultInitMetaPartitionCount                 = 3
-	defaultMaxInitMetaPartitionCount              = 100
-	defaultMaxMetaPartitionInodeID         uint64 = 1<<63 - 1
-	defaultMetaPartitionInodeIDStep        uint64 = 1 << 22
-	defaultMetaNodeReservedMem             uint64 = 1 << 30
-	runtimeStackBufSize                           = 4096
-	spaceAvailableRate                            = 0.90
-	defaultNodeSetCapacity                        = 18
-	minNumOfRWDataPartitions                      = 10
-	intervalToCheckMissingReplica                 = 600
-	intervalToWarnDataPartition                   = 600
-	intervalToLoadDataPartition                   = 12 * 60 * 60
-	defaultInitDataPartitionCnt                   = 3
-	maxInitDataPartitionCnt                       = 200
-	volExpansionRatio                             = 0.1
-	maxNumberOfDataPartitionsForExpansion         = 100
-	EmptyCrcValue                          uint32 = 4045511210
-	DefaultZoneName                               = proto.DefaultZoneName
-	retrySendSyncTaskInternal                     = 3 * time.Second
-	defaultRangeOfCountDifferencesAllowed         = 50
-	defaultMinusOfMaxInodeID                      = 1000
-	defaultNodeSetGrpBatchCnt                     = 3
-	defaultMigrateMpCnt                           = 3
-	defaultMaxReplicaCnt                          = 16
-	defaultIopsRLimit                      uint64 = 1 << 35
-	defaultIopsWLimit                      uint64 = 1 << 35
-	defaultFlowWLimit                      uint64 = 1 << 35
-	defaultFlowRLimit                      uint64 = 1 << 35
-	defaultLimitTypeCnt                           = 4
-	defaultClientTriggerHitCnt                    = 1
-	defaultClientReqPeriodSeconds                 = 1
-	defaultMaxQuotaNumPerVol                      = 100
-	defaultVolDelayDeleteTimeHour                 = 48
-	defaultMarkDiskBrokenThreshold                = 0 // decommission all dp from disk
-	defaultEnableDpMetaRepair                     = false
-	defaultAutoDpMetaRepairPallarelCnt            = 100
-	defaultAutoDecommissionDiskInterval           = 10 * time.Second
-	maxMpCreationCount                            = 10
-	defaultVolForbidWriteOpOfProtoVersion0        = true
-	defaultMetaNodeMemHighPer                     = 0.75
-	defaultMetaNodeMemLowPer                      = 0.3
-	metaNodeReserveMemorySize                     = 3 * 1024 * 1024 * 1024
-	metaNodeMemoryRatio                           = 2
-	defaultPlanExpireHours                        = 72
-	defaultGOGCLowerLimit                         = 30
-	defaultGOGCUpperLimit                         = 100
-	lowPriorityDecommissionWeight                 = 2
-	mediumPriorityDecommissionWeight              = 4
-	highPriorityDecommissionWeight                = 6
-	highestPriorityDecommissionWeight             = 8
-	diskDecommissionInfoStatType                  = 1
-	dataNodeDecommissionInfoStatType              = 2
+	defaultFaultDomainZoneCnt               = 3
+	defaultNormalCrossZoneCnt               = 3
+	defaultInitMetaPartitionCount           = 3
+	defaultMaxInitMetaPartitionCount        = 100
+	defaultMaxMetaPartitionInodeID   uint64 = 1<<63 - 1
+	defaultMetaPartitionInodeIDStep  uint64 = 1 << 22
+
+	defaultMetaNodeReservedMem                 uint64 = 1 << 30
+	runtimeStackBufSize                               = 4096
+	spaceAvailableRate                                = 0.90
+	defaultNodeSetCapacity                            = 18
+	minNumOfRWDataPartitions                          = 10
+	intervalToCheckMissingReplica                     = 600
+	intervalToWarnDataPartition                       = 600
+	intervalToLoadDataPartition                       = 12 * 60 * 60
+	defaultInitDataPartitionCnt                       = 3
+	maxInitDataPartitionCnt                           = 200
+	volExpansionRatio                                 = 0.1
+	maxNumberOfDataPartitionsForExpansion             = 100
+	EmptyCrcValue                              uint32 = 4045511210
+	DefaultZoneName                                   = proto.DefaultZoneName
+	retrySendSyncTaskInternal                         = 3 * time.Second
+	defaultRangeOfCountDifferencesAllowed             = 50
+	defaultMinusOfMaxInodeID                          = 1000
+	defaultMinusOfCommit                              = 1000
+	defaultNodeSetGrpBatchCnt                         = 3
+	defaultMaxReplicaCnt                              = 16
+	defaultIopsRLimit                          uint64 = 1 << 35
+	defaultIopsWLimit                          uint64 = 1 << 35
+	defaultFlowWLimit                          uint64 = 1 << 35
+	defaultFlowRLimit                          uint64 = 1 << 35
+	defaultLimitTypeCnt                               = 4
+	defaultClientTriggerHitCnt                        = 1
+	defaultClientReqPeriodSeconds                     = 1
+	defaultMaxQuotaNumPerVol                          = 100
+	defaultVolDelayDeleteTimeHour                     = 48
+	defaultMarkDiskBrokenThreshold                    = 0 // decommission all dp from disk
+	defaultEnableDpMetaRepair                         = false
+	defaultEnableDistributionOptimization             = false
+	defaultDistributionOptimizationConDpCnt           = 400
+	defaultDistributionOptimizationIntervalSec        = 2 * 60 * 60
+	defaultDistributionOptimizationThreshold          = 0.8
+	defaultAutoDpMetaRepairPallarelCnt                = 100
+	defaultAutoDecommissionDiskInterval               = 10 * time.Second
+	maxMpCreationCount                                = 10
+	defaultVolForbidWriteOpOfProtoVersion0            = true
+	defaultMetaNodeMemHighPer                         = 0.75
+	defaultMetaNodeMemLowPer                          = 0.3
+	metaNodeReserveMemorySize                         = 3 * 1024 * 1024 * 1024
+	metaNodeMemoryRatio                               = 2
+	defaultPlanExpireHours                            = 72
+	defaultGOGCLowerLimit                             = 30
+	defaultGOGCUpperLimit                             = 100
+	lowPriorityDecommissionWeight                     = 2
+	mediumPriorityDecommissionWeight                  = 4
+	highPriorityDecommissionWeight                    = 6
+	highestPriorityDecommissionWeight                 = 8
+	diskDecommissionInfoStatType                      = 1
+	dataNodeDecommissionInfoStatType                  = 2
+	defaultMpMigrateThreads                           = 10
 
 	maxTrashInterval     = 365 * 24 * 60
 	mpReplicaDelInterval = 300 // 5 minutes
+
+	// Learner mode recovery constants
+	defaultLearnerRecoverTimeout = 3600 // 1 hour
+	learnerRecoverRetryInterval  = 120  // 2 minutes
+	learnerRecoverMaxFailCount   = 5    // maximum failure count
+
+	defaultRocksdbDiskThreshold float32 = 0.6
 )
 
 const (
@@ -355,6 +386,12 @@ const (
 
 	opSyncAddFlashManualTask    uint32 = 0x72
 	opSyncDeleteFlashManualTask uint32 = 0x73
+
+	opSyncAddCheckSumPlan    uint32 = 0x74
+	opSyncUpdateCheckSumPlan uint32 = 0x75
+
+	opSyncAddPromoteLearnerPlan    uint32 = 0x76
+	opSyncUpdatePromoteLearnerPlan uint32 = 0x77
 )
 
 func init() {
@@ -493,7 +530,9 @@ const (
 	flashGroupPrefix      = keySeparator + "fg" + keySeparator
 	flashManualTaskPrefix = keySeparator + "flt" + keySeparator
 
-	balanceTaskKey = keySeparator + "balanceTask"
+	balanceTaskKey        = keySeparator + "balanceTask"
+	checkSumPlanKey       = keySeparator + "checkSumPlan"
+	promoteLearnerPlanKey = keySeparator + "promoteLearnerPlan"
 )
 
 // selector enum
@@ -502,6 +541,7 @@ type NodeType int
 const (
 	DataNodeType = NodeType(0)
 	MetaNodeType = NodeType(iota)
+	RocksdbType  = NodeType(iota)
 )
 
 func NodeTypeString(nodeType NodeType) string {
@@ -510,6 +550,8 @@ func NodeTypeString(nodeType NodeType) string {
 		return "dataNode"
 	case MetaNodeType:
 		return "metaNode"
+	case RocksdbType:
+		return "rocksdb"
 	default:
 		return fmt.Sprintf("unKnownNodeType(%v)", nodeType)
 	}
@@ -530,7 +572,23 @@ const (
 	ManualPlan  = "manual"
 	AutoPlan    = "auto"
 	OfflinePlan = "offline"
+	ModifyStore = "modifyStoreMode"
+	AddLearner  = "addLearner"
 
 	CheckMetaLeaderRetry    = 10
 	CheckMetaLeaderInterval = 30
+	RetryCheckStatusNum     = 600
+	MaxInodePerMp           = 4000000
+	RetryDoMigrateNum       = 3
+	RetryMigrateInterVal    = 10
+	MaxMpMigrateNum         = 1000
+
+	PlanStatusIdle     = 0
+	PlanStatusRun      = 1
+	PlanStatusStopping = 2
+
+	SelectTypeNotSet    = 0
+	SelectTypeZoneName  = 1
+	SelectTypeNodeSetId = 2
+	SelectTypeNodeAddrs = 3
 )

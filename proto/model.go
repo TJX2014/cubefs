@@ -50,6 +50,12 @@ type MetaNodeInfo struct {
 	CanAllowPartition         bool
 	MaxMpCntLimit             uint64  `json:"maxMpCntLimit"`
 	CpuUtil                   float64 `json:"cpuUtil"`
+	IsRocksdbWritable         bool
+	RocksdbTotal              uint64
+	RocksdbUsed               uint64
+	MemorySelectCount         uint64
+	RocksdbSelectCount        uint64
+	ProfPort                  string
 }
 
 // DataNode stores all the information about a data node
@@ -115,6 +121,9 @@ type MetaPartitionInfo struct {
 	StatByStorageClass        []*StatOfStorageClass
 	StatByMigrateStorageClass []*StatOfStorageClass
 	ForbidWriteOpOfProtoVer0  bool
+	MemStoreCnt               uint8
+	RockStoreCnt              uint8
+	StoreMode                 StoreMode
 }
 
 // MetaReplica defines the replica of a meta partition
@@ -126,10 +135,12 @@ type MetaReplicaInfo struct {
 	ReportTime      int64
 	Status          int8 // unavailable, readOnly, readWrite
 	IsLeader        bool
+	IsLearner       bool
 	InodeCount      uint64
 	MaxInode        uint64
 	DentryCount     uint64
 	ReadOnlyReasons uint32
+	StoreMode       StoreMode
 }
 
 // ClusterView provides the view of a cluster.
@@ -217,6 +228,7 @@ type NodeView struct {
 	IsWritable               bool
 	MediaType                uint32
 	ForbidWriteOpOfProtoVer0 bool
+	IsRocksdbWritable        bool
 }
 
 type DpRepairInfo struct {
@@ -264,6 +276,8 @@ type ZoneNodesStat struct {
 	UsedRatio     float64
 	TotalNodes    int
 	WritableNodes int
+
+	RocksdbWritableNodes int
 }
 
 type NodeSetStat struct {
@@ -282,7 +296,7 @@ type NodeSetStatInfo struct {
 	Zone                string
 	CanAllocMetaNodeCnt int
 	CanAllocDataNodeCnt int
-	MetaNodes           []*NodeStatView
+	MetaNodes           []*MetaNodeStatView
 	DataNodes           []*NodeStatView
 	DataNodeSelector    string
 	MetaNodeSelector    string
@@ -297,6 +311,14 @@ type NodeStatView struct {
 	Total      uint64
 	Used       uint64
 	Avail      uint64
+}
+
+type MetaNodeStatView struct {
+	NodeStatView
+	IsRocksdbWritable bool
+	RocksdbTotal      uint64
+	RocksdbUsed       uint64
+	RocksdbAvali      uint64
 }
 
 type NodeStatInfo struct {
@@ -623,8 +645,10 @@ type DecommissionDataPartitionInfo struct {
 	RaftForce             bool
 	Recover               bool
 	SrcAddress            string
+	SrcAddresses          []string
 	SrcDiskPath           string
 	DstAddress            string
+	DstAddresses          []string
 	DstNodeSet            uint64
 	Term                  uint64
 	Weight                int
@@ -689,8 +713,51 @@ type MetaNodeView struct {
 	DomainAddr               string
 	ID                       uint64
 	IsWritable               bool
+	IsRocksdbWritable        bool
 	MediaType                uint32
 	ForbidWriteOpOfProtoVer0 bool
 	Ratio                    float64
 	SystemRatio              float64
+}
+
+type QueryDecommissionStatusResponse struct {
+	StatusGroups []StatusGroup `json:"statusGroups"`
+	TotalCount   int           `json:"totalCount"`
+}
+
+type StatusGroup struct {
+	Status         string                          `json:"status"`
+	DataPartitions []DecommissionDataPartitionInfo `json:"dataPartitions"`
+	Count          int                             `json:"count"`
+}
+
+type DistributionOptimizationStatus struct {
+	DecommissioningDPIDs           []uint64
+	ConcurrentDpCount              int64
+	BalanceIntervalSec             int64
+	BalanceThreshold               float64
+	EnableDistributionOptimization bool
+	SSDStats                       *MediaTypeDistributionStats
+	HDDStats                       *MediaTypeDistributionStats
+}
+
+type MediaTypeDistributionStats struct {
+	TotalUnbalancedDPs   int
+	NodeSetUnbalancedDPs int
+	RackConflictDPs      int
+	CrossZoneDPs         int
+	DomainDistribution   *DomainDistributionInfo
+	RackDistribution     *RackDistributionInfo
+}
+
+type DomainDistributionInfo struct {
+	SingleDomainDPs int
+	TwoDomainDPs    int
+	ThreeDomainDPs  int
+}
+
+type RackDistributionInfo struct {
+	NoRackConflictDPs    int
+	MinorRackConflictDPs int
+	MajorRackConflictDPs int
 }

@@ -65,7 +65,9 @@ type DataPartition struct {
 	DecommissionRetry                 int
 	DecommissionStatus                uint32
 	DecommissionSrcAddr               string
+	DecommissionSrcAddrs              []string
 	DecommissionDstAddr               string
+	DecommissionDstAddrs              []string
 	DecommissionRaftForce             bool
 	DecommissionSrcDiskPath           string
 	DecommissionTerm                  uint64
@@ -2025,7 +2027,9 @@ func (partition *DataPartition) PauseDecommission(c *Cluster) bool {
 
 func (partition *DataPartition) ResetDecommissionStatus() {
 	partition.DecommissionDstAddr = ""
+	partition.DecommissionDstAddrs = nil
 	partition.DecommissionSrcAddr = ""
+	partition.DecommissionSrcAddrs = nil
 	partition.DecommissionRetry = 0
 	partition.DecommissionRaftForce = false
 	partition.DecommissionSrcDiskPath = ""

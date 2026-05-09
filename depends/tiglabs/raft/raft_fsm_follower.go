@@ -119,6 +119,7 @@ func stepFollower(r *raftFsm, m *proto.Message) {
 
 	case proto.LeaseMsgTimeout:
 		if r.leader == m.From {
+			logger.Debug("raft[%v] lease timeout at term[%d] leader[%d].", r.id, r.term, r.leader)
 			r.electionElapsed = 0
 			nmsg := proto.GetMessage()
 			nmsg.Type = proto.LocalMsgHup
@@ -145,6 +146,8 @@ func (r *raftFsm) tickElection() {
 		timeout = r.pastElectionTimeout()
 	}
 	if timeout {
+		logger.Debug("raft[%v] election timeout at term[%d] leader[%d], electionElapsed[%d], config.ElectionTick[%d], pastElectionTimeout[%v].",
+			r.id, r.term, r.leader, r.electionElapsed, r.config.ElectionTick, r.pastElectionTimeout())
 		r.electionElapsed = 0
 		m := proto.GetMessage()
 		m.Type = proto.LocalMsgHup
@@ -207,5 +210,11 @@ func (r *raftFsm) handleAppendEntries(m *proto.Message) {
 func (r *raftFsm) promotable() bool {
 	// todo check snapshot
 	pr, ok := r.replicas[r.config.NodeID]
-	return ok && pr.state != replicaStateSnapshot
+	if !ok {
+		return false
+	}
+	if pr.peer.Type == proto.PeerLearner {
+		return false
+	}
+	return pr.state != replicaStateSnapshot
 }

@@ -36,6 +36,8 @@ var (
 	ErrInvalidMpStart         = errors.New("invalid meta partition start value")
 	ErrNoAvailDataPartition   = errors.New("no available data partition")
 	ErrReshuffleArray         = errors.New("the array to be reshuffled is nil")
+	ErrVolInitFailed          = errors.New("vol init failed")
+	ErrVolNotReady            = errors.New("vol not ready")
 
 	ErrIllegalDataReplica = errors.New("data replica is illegal")
 
@@ -118,6 +120,9 @@ var (
 	ErrNoMpMigratePlan                         = errors.New("no meta partition migrate plan")
 	ErrFlashNodeFlowLimited                    = errors.New("flow limited")
 	ErrFlashNodeRunLimited                     = errors.New("run limited")
+	ErrNoRenewMpStoreModeTask                  = errors.New("no renew meta partition store mode task")
+	ErrNoCheckSumPlan                          = errors.New("no check sum plan")
+	ErrNoPromoteLearnerPlan                    = errors.New("no promote learner plan")
 )
 
 // http response error code and error message definitions

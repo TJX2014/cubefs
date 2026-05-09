@@ -44,6 +44,7 @@ import (
 const (
 	partitionPrefix        = "partition_"
 	ExpiredPartitionPrefix = "expired_"
+	rocksdbMpPrefix        = "rocksdbmp_"
 )
 
 const sampleDuration = 1 * time.Second
@@ -114,6 +115,9 @@ type metadataManager struct {
 	gcRecyclePercent     float64
 	gcTimer              *util.RecycleTimer
 	limitFactor          map[uint32]*rate.Limiter
+
+	rocksDBDirs    []string
+	rocksdbManager RocksdbManager
 }
 
 func (m *metadataManager) GetAllVolumes() (volumes *util.Set) {
@@ -592,7 +596,11 @@ func (m *metadataManager) ReloadPartition(id int) error {
 	m.mu.RUnlock()
 	mp.Stop()
 
-	return m.loadPartition(partitionPrefix + strconv.Itoa(id))
+	fileName, err := m.GetMetaPartitionPath(uint64(id))
+	if err != nil {
+		return err
+	}
+	return m.loadPartition(fileName)
 }
 
 func (m *metadataManager) loadPartition(fileName string) (err error) {
@@ -615,6 +623,7 @@ func (m *metadataManager) loadPartition(fileName string) (err error) {
 		return
 	}
 	var id uint64
+	// partitionPrefix and rocksdbMpPrefix length is equal.
 	partitionId := fileName[len(partitionPrefix):]
 	id, err = strconv.ParseUint(partitionId, 10, 64)
 	if err != nil {
@@ -647,6 +656,13 @@ func (m *metadataManager) loadPartition(fileName string) (err error) {
 		err = nil
 	}
 	partition := NewMetaPartition(partitionConfig, m)
+	if partition.GetBaseConfig().RocksDBDir != "" {
+		err = m.rocksdbManager.AttachPartition(partition.GetBaseConfig().RocksDBDir)
+		if err != nil {
+			log.LogWarnf("[loadPartitions] failed to attach partition to rocksdb manager, err(%v)", err)
+			err = nil
+		}
+	}
 	err = m.attachPartition(id, partition)
 
 	if err != nil {
@@ -694,7 +710,7 @@ func (m *metadataManager) loadPartitions() (err error) {
 	var wg sync.WaitGroup
 	curTime := "_" + time.Now().Format(StaleMetadataTimeFormat)
 	for _, fileInfo := range fileInfoList {
-		if fileInfo.IsDir() && strings.HasPrefix(fileInfo.Name(), partitionPrefix) {
+		if IsMetaPartitionDirectory(fileInfo) {
 			if isExpiredPartition(fileInfo.Name(), metaNodeInfo.PersistenceMetaPartitions) {
 				log.LogErrorf("loadPartitions: find expired partition[%s], rename it and you can delete it manually",
 					fileInfo.Name())
@@ -767,8 +783,10 @@ func (m *metadataManager) detachPartition(id uint64) (err error) {
 }
 
 func (m *metadataManager) createPartition(request *proto.CreateMetaPartitionRequest) (err error) {
+	var oldMp MetaPartition
 	partitionId := fmt.Sprintf("%d", request.PartitionID)
 	log.LogWarnf("start create meta Partition, partition %s", partitionId)
+	metaPartitionDir := m.GetMetaPartitionDir(partitionId, request.StoreMode)
 
 	mpc := &MetaPartitionConfig{
 		PartitionId: request.PartitionID,
@@ -780,18 +798,26 @@ func (m *metadataManager) createPartition(request *proto.CreateMetaPartitionRequ
 		Peers:       request.Members,
 		RaftStore:   m.raftStore,
 		NodeId:      m.nodeId,
-		RootDir:     path.Join(m.rootDir, partitionPrefix+partitionId),
+		RootDir:     metaPartitionDir,
 		ConnPool:    m.connPool,
 		VerSeq:      request.VerSeq,
+		StoreMode:   request.StoreMode,
+		RocksDBDir:  "",
 	}
 	mpc.AfterStop = func() {
 		m.detachPartition(request.PartitionID)
+	}
+
+	if oldMp, err = m.GetPartition(request.PartitionID); err == nil {
+		err = oldMp.IsEquareCreateMetaPartitionRequst(request)
+		return
 	}
 
 	partition := NewMetaPartition(mpc, m)
 
 	if err = partition.RenameStaleMetadata(); err != nil {
 		log.LogErrorf("[createPartition]->%s", err.Error())
+		return
 	}
 
 	if err = partition.PersistMetadata(); err != nil {
@@ -923,6 +949,8 @@ func NewMetadataManager(conf MetadataManagerConfig, metaNode *MetaNode) Metadata
 		enableGcTimer:        conf.EnableGcTimer,
 		gcRecyclePercent:     conf.GcRecyclePercent,
 		limitFactor:          make(map[uint32]*rate.Limiter),
+		rocksDBDirs:          metaNode.rocksDirs,
+		rocksdbManager:       metaNode.rocksdbManager,
 	}
 	m.limitFactor[readDirIops] = rate.NewLimiter(rate.Limit(metaNode.readDirIops), metaNode.readDirIops/2)
 
@@ -936,6 +964,7 @@ func isExpiredPartition(fileName string, partitions []uint64) (expiredPartition 
 		return true
 	}
 
+	// partitionPrefix and rocksdbMpPrefix length is equal.
 	partitionId := fileName[len(partitionPrefix):]
 	id, err := strconv.ParseUint(partitionId, 10, 64)
 	if err != nil {
@@ -949,4 +978,51 @@ func isExpiredPartition(fileName string, partitions []uint64) (expiredPartition 
 		}
 	}
 	return true
+}
+
+func (m *metadataManager) GetMetaPartitionPath(partitionId uint64) (string, error) {
+	fileName := rocksdbMpPrefix + strconv.FormatUint(partitionId, 10)
+	filePath := path.Join(m.rootDir, fileName)
+	if _, err := os.Stat(filePath); err == nil {
+		return fileName, nil
+	}
+
+	fileName = partitionPrefix + strconv.FormatUint(partitionId, 10)
+	filePath = path.Join(m.rootDir, fileName)
+	if _, err := os.Stat(filePath); err == nil {
+		return fileName, nil
+	}
+	return "", errors.NewErrorf("meta partition %d directory not found", partitionId)
+}
+
+func IsMetaPartitionDirectory(fileInfo os.DirEntry) bool {
+	if !fileInfo.IsDir() {
+		return false
+	}
+	if strings.HasPrefix(fileInfo.Name(), partitionPrefix) {
+		return true
+	}
+	if strings.HasPrefix(fileInfo.Name(), rocksdbMpPrefix) {
+		return true
+	}
+	return false
+}
+
+func (m *metadataManager) GetMetaPartitionDir(partitionId string, storeMode proto.StoreMode) string {
+	var metaPartitionDir string
+	var checkDeleteDir string
+	if storeMode == proto.StoreModeRocksDb {
+		metaPartitionDir = path.Join(m.rootDir, rocksdbMpPrefix+partitionId)
+		checkDeleteDir = path.Join(m.rootDir, partitionPrefix+partitionId)
+	} else {
+		metaPartitionDir = path.Join(m.rootDir, partitionPrefix+partitionId)
+		checkDeleteDir = path.Join(m.rootDir, rocksdbMpPrefix+partitionId)
+	}
+
+	if _, err := os.Stat(checkDeleteDir); err == nil {
+		log.LogWarnf("mp(%s) store(%v) Delete old meta partition directory: %s", partitionId, storeMode, checkDeleteDir)
+		os.RemoveAll(checkDeleteDir)
+	}
+
+	return metaPartitionDir
 }

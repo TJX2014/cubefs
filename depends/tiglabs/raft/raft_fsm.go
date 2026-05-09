@@ -436,6 +436,10 @@ func (r *raftFsm) applyConfChange(cc *proto.ConfChange) (ok bool) {
 		return r.removePeer(cc.Peer)
 	case proto.ConfUpdateNode:
 		r.updatePeer(cc.Peer)
+	case proto.ConfAddLearner:
+		r.addLearner(cc.Peer)
+	case proto.ConfPromoteLearner:
+		r.promoteLearner(cc.Peer)
 	}
 	return
 }
@@ -488,8 +492,46 @@ func (r *raftFsm) updatePeer(peer proto.Peer) {
 	}
 }
 
+func (r *raftFsm) addLearner(peer proto.Peer) {
+	r.pendingConf = false
+	peer.Type = proto.PeerLearner
+	if _, ok := r.replicas[peer.ID]; !ok {
+		if r.state == stateLeader {
+			r.replicas[peer.ID] = newReplica(peer, r.config.MaxInflightMsgs)
+			r.replicas[peer.ID].next = r.raftLog.lastIndex() + 1
+		} else {
+			r.replicas[peer.ID] = newReplica(peer, 0)
+		}
+		if logger.IsEnableDebug() {
+			logger.Debug("raft[%v] added learner[%v]", r.id, peer.String())
+		}
+	}
+}
+
+func (r *raftFsm) promoteLearner(peer proto.Peer) {
+	r.pendingConf = false
+	replica, ok := r.replicas[peer.ID]
+	if !ok {
+		if logger.IsEnableWarn() {
+			logger.Warn("raft[%v] learner[%v] not found for promotion", r.id, peer.String())
+		}
+		return
+	}
+	replica.peer.Type = proto.PeerNormal
+	replica.peer.Priority = peer.Priority
+	if logger.IsEnableDebug() {
+		logger.Debug("raft[%v] promoted learner[%v] to voter", r.id, peer.String())
+	}
+}
+
 func (r *raftFsm) quorum() int {
-	return len(r.replicas)/2 + 1
+	voters := 0
+	for _, pr := range r.replicas {
+		if pr.peer.Type != proto.PeerLearner {
+			voters++
+		}
+	}
+	return voters/2 + 1
 }
 
 func (r *raftFsm) send(m *proto.Message) {

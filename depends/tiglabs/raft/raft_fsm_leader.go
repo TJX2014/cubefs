@@ -427,8 +427,10 @@ func (r *raftFsm) tickHeartbeat() {
 func (r *raftFsm) tickElectionAck() {
 	r.electionElapsed++
 	if r.electionElapsed >= r.config.ElectionTick {
-		r.electionElapsed = 0
+		logger.Debug("raft[%v] election timeout at term[%d] leader[%d], electionElapsed[%d], config.ElectionTick[%d].",
+			r.id, r.term, r.leader, r.electionElapsed, r.config.ElectionTick)
 
+		r.electionElapsed = 0
 		m := proto.GetMessage()
 		m.Type = proto.LocalMsgHup
 		m.From = r.config.NodeID
@@ -439,6 +441,9 @@ func (r *raftFsm) tickElectionAck() {
 func (r *raftFsm) checkLeaderLease() bool {
 	var act int
 	for id, peer := range r.replicas {
+		if peer.peer.Type == proto.PeerLearner {
+			continue
+		}
 		if id == r.config.NodeID || peer.state == replicaStateSnapshot {
 			act++
 			continue
@@ -458,7 +463,12 @@ func (r *raftFsm) checkLeaderLease() bool {
 func (r *raftFsm) maybeCommit() bool {
 	mis := make(util.Uint64Slice, 0, len(r.replicas))
 	for _, rp := range r.replicas {
-		mis = append(mis, rp.match)
+		if rp.peer.Type != proto.PeerLearner {
+			mis = append(mis, rp.match)
+		}
+	}
+	if len(mis) == 0 {
+		return false
 	}
 	sort.Sort(sort.Reverse(mis))
 	mci := mis[r.quorum()-1]
@@ -577,8 +587,11 @@ func (r *raftFsm) bcastReadOnly() {
 	if logger.IsEnableDebug() {
 		logger.Debug("raft[%d] bcast readonly index: %d", r.id, index)
 	}
-	for id := range r.replicas {
+	for id, peer := range r.replicas {
 		if id == r.config.NodeID {
+			continue
+		}
+		if peer.peer.Type == proto.PeerLearner {
 			continue
 		}
 		msg := proto.GetMessage()

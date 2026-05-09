@@ -33,9 +33,10 @@ type MetaNode struct {
 	IsActive                         bool
 	Sender                           *AdminTaskManager `graphql:"-"`
 	ZoneName                         string            `json:"Zone"`
-	MaxMemAvailWeight                uint64            `json:"MaxMemAvailWeight"`
-	Total                            uint64            `json:"TotalWeight"`
-	Used                             uint64            `json:"UsedWeight"`
+	Rack                             string
+	MaxMemAvailWeight                uint64 `json:"MaxMemAvailWeight"`
+	Total                            uint64 `json:"TotalWeight"`
+	Used                             uint64 `json:"UsedWeight"`
 	Ratio                            float64
 	NodeMemTotal                     uint64
 	NodeMemUsed                      uint64
@@ -49,20 +50,26 @@ type MetaNode struct {
 	ToBeOffline                      bool
 	PersistenceMetaPartitions        []uint64
 	RdOnly                           bool
+	RocksdbRdOnly                    bool
+	SelectTag                        string
 	MigrateLock                      sync.RWMutex
 	MpCntLimit                       uint64             `json:"-"` // max count of meta partition in a meta node
 	CpuUtil                          atomicutil.Float64 `json:"-"`
 	HeartbeatPort                    string             `json:"HeartbeatPort"`
 	ReplicaPort                      string             `json:"ReplicaPort"`
 	ReceivedForbidWriteOpOfProtoVer0 bool
+	RocksdbDisks                     []*proto.MetaNodeRocksdbInfo
+	RocksdbDiskThreshold             float32
+	RocksdbKeyNumMax                 uint64
 }
 
-func newMetaNode(addr, heartbeatPort, replicaPort, zoneName, clusterID string) (node *MetaNode) {
+func newMetaNode(addr, heartbeatPort, replicaPort, zoneName, rack, clusterID string) (node *MetaNode) {
 	node = &MetaNode{
 		Addr:          addr,
 		HeartbeatPort: heartbeatPort,
 		ReplicaPort:   replicaPort,
 		ZoneName:      zoneName,
+		Rack:          rack,
 		Sender:        newAdminTaskManager(addr, clusterID),
 	}
 	node.CpuUtil.Store(0)
@@ -71,6 +78,12 @@ func newMetaNode(addr, heartbeatPort, replicaPort, zoneName, clusterID string) (
 
 func (metaNode *MetaNode) IsActiveNode() bool {
 	return metaNode.IsActive
+}
+
+func (metaNode *MetaNode) IsOffline() bool {
+	metaNode.RLock()
+	defer metaNode.RUnlock()
+	return metaNode.ToBeOffline
 }
 
 func (metaNode *MetaNode) clean() {
@@ -154,7 +167,7 @@ func (metaNode *MetaNode) setNodeActive() {
 	metaNode.IsActive = true
 }
 
-func (metaNode *MetaNode) updateMetric(resp *proto.MetaNodeHeartbeatResponse, threshold float32) {
+func (metaNode *MetaNode) updateMetric(resp *proto.MetaNodeHeartbeatResponse, threshold, rocksdbDiskThreshold float32) {
 	metaNode.Lock()
 	defer metaNode.Unlock()
 
@@ -178,6 +191,7 @@ func (metaNode *MetaNode) updateMetric(resp *proto.MetaNodeHeartbeatResponse, th
 	metaNode.Threshold = threshold
 	metaNode.NodeMemTotal = resp.NodeMemTotal
 	metaNode.NodeMemUsed = resp.NodeMemUsed
+	metaNode.RocksdbDiskThreshold = rocksdbDiskThreshold
 }
 
 func (metaNode *MetaNode) reachesThreshold() bool {
@@ -237,8 +251,16 @@ func (metaNode *MetaNode) PartitionCntLimited() bool {
 	return uint64(metaNode.MetaPartitionCount) <= metaNode.GetPartitionLimitCnt()
 }
 
-func (metaNode *MetaNode) IsOffline() bool {
-	return metaNode.ToBeOffline
+func (metaNode *MetaNode) PartitionCntLimitedEx(count int) bool {
+	return uint64(metaNode.MetaPartitionCount+count) <= metaNode.GetPartitionLimitCnt()
+}
+
+func (metaNode *MetaNode) systemMemoryReachesThreshold() bool {
+	return CaculateNodeMemoryRatio(metaNode) >= gConfig.metaNodeMemHighPer
+}
+
+func (metaNode *MetaNode) rocksdbDiskKeyNumUnderMax() bool {
+	return true
 }
 
 // LeaderMetaNode define the leader metaPartitions in meta node
@@ -319,4 +341,67 @@ func (s *sortLeaderMetaNode) balanceLeader() {
 		log.LogDebugf("node[%v] leader count is:%d,average:%d", node.addr, len(node.metaPartitions), s.average)
 		s.changeLeader(node)
 	}
+}
+
+func (metaNode *MetaNode) GetRocksdbTotal() (total uint64) {
+	for _, disk := range metaNode.RocksdbDisks {
+		total += disk.Total
+	}
+	return
+}
+
+func (metaNode *MetaNode) GetRocksdbUsed() (used uint64) {
+	for _, disk := range metaNode.RocksdbDisks {
+		used += disk.Used
+	}
+	return
+}
+
+func (metaNode *MetaNode) reachesRocksdbDisksThreshold() bool {
+	var total, used uint64
+	if metaNode.RocksdbDiskThreshold <= 0 {
+		metaNode.RocksdbDiskThreshold = defaultRocksdbDiskThreshold
+	}
+	if len(metaNode.RocksdbDisks) == 0 {
+		return true
+	}
+	total = metaNode.GetRocksdbTotal()
+	used = metaNode.GetRocksdbUsed()
+	if total == 0 {
+		log.LogErrorf("[reachesRocksdbDisksThreshold] metanode(%v) total is 0", metaNode.Addr)
+		return true
+	}
+	threshold := metaNode.RocksdbDiskThreshold
+	return float32(used)/float32(total) > threshold
+}
+
+func (metaNode *MetaNode) isWritable(storeMode proto.StoreMode) (ok bool) {
+	metaNode.RLock()
+	defer metaNode.RUnlock()
+
+	log.LogDebugf("[isWritable] mn(%v) check writable store mode(%v)", metaNode.Addr, storeMode)
+
+	if metaNode.IsActive {
+		switch storeMode {
+		case proto.StoreModeMem:
+			if metaNode.MaxMemAvailWeight > gConfig.metaNodeReservedMem &&
+				!metaNode.reachesThreshold() &&
+				metaNode.MetaPartitionCount < defaultMaxMetaPartitionCountOnEachNode &&
+				!metaNode.RdOnly {
+				ok = true
+			}
+		case proto.StoreModeRocksDb:
+			if !metaNode.RdOnly && !metaNode.reachesRocksdbDisksThreshold() {
+				ok = true
+			}
+		default:
+		}
+	}
+	return
+}
+
+func (metaNode *MetaNode) updateRocksdbDisks(resp *proto.MetaNodeHeartbeatResponse) {
+	metaNode.Lock()
+	defer metaNode.Unlock()
+	metaNode.RocksdbDisks = resp.RocksDBDiskInfo
 }

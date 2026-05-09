@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"sync"
 
+	raftproto "github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	"github.com/cubefs/cubefs/util"
 )
 
@@ -34,10 +35,16 @@ type CreateNameSpaceResponse struct {
 
 // Peer defines the peer of the node id and address.
 type Peer struct {
-	ID            uint64 `json:"id"`
-	Addr          string `json:"addr"`
-	HeartbeatPort string `json:"raftHeartbeat"`
-	ReplicaPort   string `json:"raftReplica"`
+	Type          raftproto.PeerType `json:"type"`
+	ID            uint64             `json:"id"`
+	Addr          string             `json:"addr"`
+	HeartbeatPort string             `json:"raftHeartbeat"`
+	ReplicaPort   string             `json:"raftReplica"`
+}
+
+func (p *Peer) String() string {
+	return fmt.Sprintf("type[%v],id[%v],addr[%v],heartbeatPort[%v],replicaPort[%v]",
+		p.Type, p.ID, p.Addr, p.HeartbeatPort, p.ReplicaPort)
 }
 
 // CreateMetaPartitionRequest defines the request to create a meta partition.
@@ -49,6 +56,7 @@ type CreateMetaPartitionRequest struct {
 	PartitionID uint64
 	Members     []Peer
 	VerSeq      uint64
+	StoreMode   StoreMode
 }
 
 // CreateMetaPartitionResponse defines the response to the request of creating a meta partition.
@@ -183,4 +191,38 @@ func (st *StatOfStorageClass) Full() bool {
 func (st *StatOfStorageClass) String() string {
 	return fmt.Sprintf("class(%s)_inoCnt(%d)_used(%d)_quota(%d)GB",
 		StorageClassString(st.StorageClass), st.InodeCount, st.UsedSizeBytes, st.QuotaGB)
+}
+
+type StoreMode uint8
+
+const StoreModeDef StoreMode = 0
+const (
+	StoreModeMem StoreMode = 1 << iota
+	StoreModeRocksDb
+	StoreModeMax
+)
+
+func (mode *StoreMode) Str() string {
+	switch *mode {
+	case StoreModeMem:
+		return "Memory"
+	case StoreModeRocksDb:
+		return "Rocksdb"
+	case StoreModeMem | StoreModeRocksDb:
+		return "Memory&Rocksdb"
+	default:
+	}
+	return "Unknown"
+}
+
+func (mode *StoreMode) Valid() (ok bool) {
+	ok = *mode == StoreModeMem || *mode == StoreModeRocksDb
+	return
+}
+
+type SelectMetaNodeInfo struct {
+	PartitionID uint64 `json:"partition_id"`
+	OldNodeAddr string `json:"old_node_addr"`
+	NewNodeAddr string `json:"new_node_addr"`
+	StoreMode   uint8  `json:"store_mode"`
 }

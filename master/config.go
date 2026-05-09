@@ -133,6 +133,12 @@ const (
 	defaultFlashKeyFlowLimit            = 0
 	defaultRemoteClientFlowLimit        = 0
 
+	defaultDpLimitUnitSizeGB   uint64 = 120
+	defaultDpLimitSsdBaseCount uint64 = 200
+	defaultDpLimitSsdFactor    uint64 = 50
+	defaultDpLimitHddBaseCount uint64 = 100
+	defaultDpLimitHddFactor    uint64 = 20
+
 	defaultMetaNodeGOGC = 100
 	defaultDataNodeGOGC = 100
 )
@@ -159,6 +165,7 @@ type clusterConfig struct {
 	numberOfDataPartitionsToLoad        int
 	nodeSetCapacity                     int
 	MetaNodeThreshold                   float32
+	MetaNodeRocksdbDiskThreshold        float32
 	ClusterLoadFactor                   float32
 	MetaNodeDeleteBatchCount            uint64 // metanode delete batch count
 	DataNodeDeleteLimitRate             uint64 // datanode delete limit rate
@@ -226,6 +233,13 @@ type clusterConfig struct {
 	SingleNodeMode     bool
 
 	MaxWritableDataPartitionCnt int
+	RackAwareLevel              pt.RackAwareLevel
+	LearnerRecoverTimeoutSeconds int64
+	DpLimitSsdBaseCount          uint64
+	DpLimitSsdFactor             uint64
+	DpLimitHddBaseCount          uint64
+	DpLimitHddFactor             uint64
+	DefaultVolStoreMode          pt.StoreMode
 }
 
 func newClusterConfig() (cfg *clusterConfig) {
@@ -244,6 +258,7 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.numberOfDataPartitionsToLoad = defaultNumberOfDataPartitionsToLoad
 	cfg.PeriodToLoadALLDataPartitions = defaultPeriodToLoadAllDataPartitions
 	cfg.MetaNodeThreshold = defaultMetaPartitionMemUsageThreshold
+	cfg.MetaNodeRocksdbDiskThreshold = defaultRocksdbDiskThreshold
 	cfg.ClusterLoadFactor = defaultOverSoldFactor
 	// cfg.MaxDpCntLimit = defaultMaxDpCntLimit
 	// cfg.MaxMpCntLimit = defaultMaxMpCntLimit
@@ -269,6 +284,13 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.metaNodeMemHighPer = defaultMetaNodeMemHighPer
 	cfg.metaNodeMemLowPer = defaultMetaNodeMemLowPer
 	cfg.metaNodeMemMidPer = defaultMetaNodeMemHighPer
+	cfg.RackAwareLevel = pt.RackAwareNone
+	cfg.LearnerRecoverTimeoutSeconds = defaultLearnerRecoverTimeout
+	cfg.DpLimitSsdBaseCount = defaultDpLimitSsdBaseCount
+	cfg.DpLimitSsdFactor = defaultDpLimitSsdFactor
+	cfg.DpLimitHddBaseCount = defaultDpLimitHddBaseCount
+	cfg.DpLimitHddFactor = defaultDpLimitHddFactor
+	cfg.DefaultVolStoreMode = pt.StoreModeMem
 	return
 }
 

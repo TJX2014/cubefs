@@ -119,6 +119,7 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 		volsForbidWriteOpOfProtoVer0 = make(map[string]struct{})
 		fileStatsEnableChange        bool
 		thresholdsChange             bool
+		diskStat                     []*proto.MetaNodeRocksdbInfo
 	)
 	start := time.Now()
 	go func() {
@@ -191,7 +192,8 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 		}
 		// set cpu util and io used in here
 		resp.CpuUtil = m.cpuUtil.Load()
-
+		log.LogDebugf("[opMasterHeartbeat] collect rocksdb info")
+		diskStat = m.metaNode.getRocksDBDiskStat()
 		m.Range(true, func(id uint64, partition MetaPartition) bool {
 			m.checkFollowerRead(req.FLReadVols, partition)
 			m.checkForbiddenVolume(req.ForbiddenVols, partition)
@@ -222,16 +224,35 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 				ForbidWriteOpOfProtoVer0:  mpForbidWriteVer0,
 				LocalPeers:                mConf.Peers,
 				ReadOnlyReasons:           0,
+				StoreMode:                 mConf.StoreMode,
 			}
-			mpr.TxCnt, mpr.TxRbInoCnt, mpr.TxRbDenCnt = partition.TxGetCnt()
+			mpr.TxCnt, mpr.TxRbInoCnt, mpr.TxRbDenCnt, err = partition.TxGetCnt()
+			if err != nil {
+				log.LogErrorf("[opMasterHeartbeat] mp(%v) failed to open snapshot, err(%v)", mConf.PartitionId, err)
+				return true
+			}
 
 			if mConf.Cursor >= mConf.End {
 				mpr.Status = proto.ReadOnly
 				mpr.ReadOnlyReasons |= proto.MpCursorOutOfRange
 			}
-			if resp.Used > uint64(float64(resp.Total)*MaxUsedMemFactor) {
+
+			switch mConf.StoreMode {
+			case proto.StoreModeMem:
+				if resp.Used > uint64(float64(resp.Total)*MaxUsedMemFactor) {
+					mpr.Status = proto.ReadOnly
+					mpr.ReadOnlyReasons |= proto.MetaMemUseLimit
+				}
+			case proto.StoreModeRocksDb:
+				for _, stat := range diskStat {
+					if stat.Path == mConf.RocksDBDir &&
+						stat.UsageRatio >= 0.8 {
+						mpr.Status = proto.ReadOnly
+					}
+				}
+			default:
+				log.LogErrorf("[opMasterHeartbeat] mp(%v) unknown store mode, set read only", mConf.PartitionId)
 				mpr.Status = proto.ReadOnly
-				mpr.ReadOnlyReasons |= proto.MetaMemUseLimit
 			}
 
 			addr, isLeader := partition.IsLeader()
@@ -245,6 +266,7 @@ func (m *metadataManager) opMasterHeartbeat(conn net.Conn, p *Packet,
 		})
 		resp.ZoneName = m.zoneName
 		resp.ReceivedForbidWriteOpOfProtoVer0 = m.metaNode.nodeForbidWriteOpOfProtoVer0
+		resp.RocksDBDiskInfo = diskStat
 		resp.Status = proto.TaskSucceeds
 	end:
 		adminTask.Request = nil
@@ -1536,6 +1558,11 @@ func (m *metadataManager) opDeleteMetaPartition(conn net.Conn,
 	conf := mp.GetBaseConfig()
 	mp.Stop()
 	mp.DeleteRaft()
+	err = mp.Reset()
+	if err != nil {
+		log.LogErrorf("[deletePartition] failed to clear mp(%v) data, err(%v)", conf.PartitionId, err)
+		err = nil
+	}
 	m.deletePartition(mp.GetBaseConfig().PartitionId)
 	os.RemoveAll(conf.RootDir)
 	p.PacketOkReply()
@@ -1699,11 +1726,11 @@ func (m *metadataManager) opAddMetaPartitionRaftMember(conn net.Conn,
 
 	defer func() {
 		if err != nil {
-			log.LogInfof("pkt %s remote %s reqId add raft member failed, req %v, err %s", p.String(), remoteAddr, adminTask, err.Error())
+			log.LogWarnf("opAddMetaPartitionRaftMember: pkt %s remote %s failed, req %v, err %s", p.String(), remoteAddr, adminTask, err.Error())
 			return
 		}
 
-		log.LogInfof("pkt %s, remote %s add raft member success, req %v", p.String(), remoteAddr, adminTask)
+		log.LogWarnf("pkt %s, remote %s %s success, req %v", p.String(), remoteAddr, req.String(), adminTask)
 	}()
 
 	decode := json.NewDecoder(bytes.NewBuffer(p.Data))
@@ -1720,13 +1747,35 @@ func (m *metadataManager) opAddMetaPartitionRaftMember(conn net.Conn,
 		return err
 	}
 
-	if mp.IsExsitPeer(req.AddPeer) {
+	if mp.IsExsitPeer(req.AddPeer) && req.OpType != proto.OpTypePromoteLearner {
+		log.LogWarnf("[opAddMetaPartitionRaftMember]: peer %v already exists in partition %v", req.AddPeer.ID, req.PartitionId)
 		p.PacketOkReply()
 		m.respondToClientWithVer(conn, p)
 		return
 	}
 
-	log.LogInfof("[%s], remote %s start add raft member, req %v", p.String(), remoteAddr, adminTask)
+	// Check maximum learner number limit when adding learner
+	if req.OpType == proto.OpTypeAddLearner {
+		learnerCount := 0
+		config := mp.GetBaseConfig()
+		for _, peer := range config.Peers {
+			if peer.Type == raftProto.PeerLearner {
+				learnerCount++
+			}
+		}
+		if learnerCount >= proto.MaxMetaPartitionLearnerNum {
+			err = errors.NewErrorf("[opAddMetaPartitionRaftMember]: partitionID[%v] exceeds maximum learner number limit, current learners[%v], max allowed[%v]",
+				req.PartitionId, learnerCount, proto.MaxMetaPartitionLearnerNum)
+			log.LogWarnf("[opAddMetaPartitionRaftMember]: %v", err)
+			p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
+			m.respondToClientWithVer(conn, p)
+			return err
+		}
+		log.LogWarnf("[opAddMetaPartitionRaftMember]: learner count check passed, partitionID[%v], currentLearners[%v], maxAllowed[%v]",
+			req.PartitionId, learnerCount, proto.MaxMetaPartitionLearnerNum)
+	}
+
+	log.LogWarnf("[%s], remote %s start %s, req %v", p.String(), remoteAddr, req.String(), adminTask)
 
 	if !m.serveProxy(conn, mp, p) {
 		return nil
@@ -1746,8 +1795,27 @@ func (m *metadataManager) opAddMetaPartitionRaftMember(conn net.Conn,
 		m.respondToClientWithVer(conn, p)
 		return
 	}
-	_, err = mp.ChangeMember(raftProto.ConfAddNode,
-		raftProto.Peer{ID: req.AddPeer.ID}, reqData)
+	// Determine operation type based on OpType field
+	var changeType raftProto.ConfChangeType
+	var peerType raftProto.PeerType
+	switch req.OpType {
+	case proto.OpTypeAddLearner:
+		changeType = raftProto.ConfAddLearner
+		peerType = raftProto.PeerLearner
+		log.LogWarnf("[opAddMetaPartitionRaftMember]: adding learner node %v to partition %v", req.AddPeer.ID, req.PartitionId)
+	case proto.OpTypePromoteLearner:
+		changeType = raftProto.ConfPromoteLearner
+		peerType = raftProto.PeerNormal
+		log.LogWarnf("[opAddMetaPartitionRaftMember]: promoting learner node %v to voter in partition %v", req.AddPeer.ID, req.PartitionId)
+	default:
+		// Default to AddRaftMember for backward compatibility
+		changeType = raftProto.ConfAddNode
+		peerType = raftProto.PeerNormal
+		log.LogWarnf("[opAddMetaPartitionRaftMember]: adding raft member node %v to partition %v", req.AddPeer.ID, req.PartitionId)
+	}
+
+	_, err = mp.ChangeMember(changeType,
+		raftProto.Peer{ID: req.AddPeer.ID, Type: peerType}, reqData)
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
 		m.respondToClientWithVer(conn, p)

@@ -45,8 +45,9 @@ import (
 )
 
 var (
-	clusterDpCntLimit uint64
-	clusterMpCntLimit uint64
+	clusterDpCntLimit                 uint64
+	clusterMpCntLimit                 uint64
+	distributionOptimizationThreshold atomicutil.Float64
 )
 
 // nolint: structcheck
@@ -116,12 +117,15 @@ type ClusterDecommission struct {
 	MarkDiskBrokenThreshold                atomicutil.Float64
 	badPartitionMutex                      sync.RWMutex // BadDataPartitionIds and BadMetaPartitionIds operate mutex
 
-	ForbidMpDecommission        bool
-	EnableAutoDpMetaRepair      atomicutil.Bool
-	EnableAutoDecommissionDisk  atomicutil.Bool
-	AutoDecommissionInterval    atomicutil.Int64
-	AutoDpMetaRepairParallelCnt atomicutil.Uint32
-	server                      *Server
+	ForbidMpDecommission           bool
+	EnableMpDecommissionByLearner  bool
+	EnableAutoDpMetaRepair         atomicutil.Bool
+	EnableAutoDecommissionDisk     atomicutil.Bool
+	AutoDecommissionInterval       atomicutil.Int64
+	AutoDpMetaRepairParallelCnt    atomicutil.Uint32
+	EnableDistributionOptimization atomicutil.Bool
+	DistributionOptimizationConDpCnt atomicutil.Int64
+	server                         *Server
 }
 
 type CleanTask struct {
@@ -185,6 +189,7 @@ type Cluster struct {
 	mu          sync.Mutex
 	PlanRun     bool
 	flashManMgr *flashManualTaskManager
+	planStatus  uint32
 }
 
 type cTask struct {
@@ -480,6 +485,8 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.MarkDiskBrokenThreshold.Store(defaultMarkDiskBrokenThreshold)
 	c.EnableAutoDpMetaRepair.Store(defaultEnableDpMetaRepair)
 	c.AutoDecommissionInterval.Store(int64(defaultAutoDecommissionDiskInterval))
+	c.EnableDistributionOptimization.Store(defaultEnableDistributionOptimization)
+	c.DistributionOptimizationConDpCnt.Store(int64(defaultDistributionOptimizationConDpCnt))
 	c.server = server
 	c.flashNodeTopo = flashgroupmanager.NewFlashNodeTopology()
 	c.flashNodeTopo.SyncFlashGroupFunc = c.syncUpdateFlashGroup
@@ -553,8 +560,9 @@ func (c *Cluster) addNodeSetGrp(ns *nodeSet, load bool) (err error) {
 }
 
 const (
-	TypeMetaPartition uint32 = 0x01
-	TypeDataPartition uint32 = 0x02
+	TypeMetaPartition    uint32 = 0x01
+	TypeDataPartition    uint32 = 0x02
+	TypeRocksdbPartition uint32 = 0x03
 )
 
 func (c *Cluster) getHostFromDomainZone(domainId uint64, createType uint32, replicaNum uint8, mediaType uint32) (hosts []string, peers []proto.Peer, err error) {
@@ -1267,7 +1275,7 @@ func (c *Cluster) addMetaNode(nodeAddr, heartbeatPort, replicaPort, zoneName str
 		}
 	}
 
-	metaNode = newMetaNode(nodeAddr, heartbeatPort, replicaPort, zoneName, c.Name)
+	metaNode = newMetaNode(nodeAddr, heartbeatPort, replicaPort, zoneName, proto.DefaultRack, c.Name)
 	zone, err := c.t.getZone(zoneName)
 	if err != nil {
 		log.LogInfof("[addMetaNode] create zone(%v) by metanode(%v)", zoneName, nodeAddr)
@@ -2057,10 +2065,10 @@ func (c *Cluster) syncCreateDataPartitionToDataNode(host string, size uint64, dp
 	return string(resp.Data), nil
 }
 
-func (c *Cluster) syncCreateMetaPartitionToMetaNode(host string, mp *MetaPartition) (err error) {
+func (c *Cluster) syncCreateMetaPartitionToMetaNode(host string, mp *MetaPartition, storeMode proto.StoreMode) (err error) {
 	hosts := make([]string, 0)
 	hosts = append(hosts, host)
-	tasks := mp.buildNewMetaPartitionTasks(hosts, mp.Peers, mp.volName)
+	tasks := mp.buildNewMetaPartitionTasks(hosts, mp.Peers, mp.volName, storeMode)
 	metaNode, err := c.metaNode(host)
 	if err != nil {
 		return
@@ -2251,13 +2259,21 @@ func (c *Cluster) getHostFromNormalZone(nodeType uint32, excludeZones []string, 
 	}
 	if nodeType == TypeDataPartition {
 		rsMgr = &c.t.dataTopology
+		// get all zones that qualified
+		if zonesQualified, err = c.t.allocZonesForNode(rsMgr, zoneNumNeed, replicaNum, excludeZones, specifiedZones, dataMediaType); err != nil {
+			return
+		}
 	} else {
 		rsMgr = &c.t.metaTopology
-	}
-
-	// get all zones that qualified
-	if zonesQualified, err = c.t.allocZonesForNode(rsMgr, zoneNumNeed, replicaNum, excludeZones, specifiedZones, dataMediaType); err != nil {
-		return
+		if nodeType == TypeMetaPartition {
+			if zonesQualified, err = c.t.allocZonesForMetaNode(zoneNumNeed, replicaNum, excludeZones, proto.StoreModeMem); err != nil {
+				return
+			}
+		} else {
+			if zonesQualified, err = c.t.allocZonesForMetaNode(zoneNumNeed, replicaNum, excludeZones, proto.StoreModeRocksDb); err != nil {
+				return
+			}
+		}
 	}
 
 	if len(zonesQualified) == 1 {
@@ -3667,7 +3683,7 @@ func (c *Cluster) migrateMetaNode(srcAddr, targetAddr string, limit int) (err er
 	}
 
 	if limit <= 0 {
-		limit = defaultMigrateMpCnt
+		limit = defaultMpMigrateThreads
 	}
 
 	if limit > len(toBeOfflineMps) {
@@ -3688,7 +3704,19 @@ func (c *Cluster) migrateMetaNode(srcAddr, targetAddr string, limit int) (err er
 		wg.Add(1)
 		go func(mp *MetaPartition) {
 			defer wg.Done()
-			if err1 := c.migrateMetaPartition(srcAddr, targetAddr, mp); err1 != nil {
+			vol, err1 := c.getVol(mp.volName)
+			if err1 != nil {
+				errChannel <- err1
+				return
+			}
+			storeMode := vol.DefaultStoreMode
+			for _, replica := range mp.Replicas {
+				if replica.Addr == srcAddr {
+					storeMode = replica.StoreMode
+					break
+				}
+			}
+			if err1 = c.migrateMetaPartition(srcAddr, targetAddr, mp, storeMode); err1 != nil {
 				errChannel <- err1
 			}
 		}(toBeOfflineMps[idx])
@@ -4115,6 +4143,7 @@ func (c *Cluster) doCreateVol(req *createVolReq) (vol *Vol, err error) {
 		FlashNodeTimeoutCount:        req.flashNodeTimeoutCount,
 		RemoteCacheSameZoneTimeout:   req.remoteCacheSameZoneTimeout,
 		RemoteCacheSameRegionTimeout: req.remoteCacheSameRegionTimeout,
+		DefaultStoreMode:             req.storeMode,
 	}
 
 	vv.QuotaOfClass = make([]*proto.StatOfStorageClass, 0)
@@ -4221,9 +4250,14 @@ func (c *Cluster) allMetaNodes() (metaNodes []proto.NodeView) {
 	c.metaNodes.Range(func(addr, node interface{}) bool {
 		metaNode := node.(*MetaNode)
 		metaNodes = append(metaNodes, proto.NodeView{
-			ID: metaNode.ID, Addr: metaNode.Addr, DomainAddr: metaNode.DomainAddr,
-			Status: metaNode.IsActive, IsWritable: metaNode.IsWriteAble(), MediaType: proto.MediaType_Unspecified,
+			ID:                       metaNode.ID,
+			Addr:                     metaNode.Addr,
+			DomainAddr:               metaNode.DomainAddr,
+			Status:                   metaNode.IsActive,
+			IsWritable:               metaNode.isWritable(proto.StoreModeMem),
+			MediaType:                proto.MediaType_Unspecified,
 			ForbidWriteOpOfProtoVer0: metaNode.ReceivedForbidWriteOpOfProtoVer0,
+			IsRocksdbWritable:        metaNode.isWritable(proto.StoreModeRocksDb),
 		})
 		return true
 	})
@@ -4656,6 +4690,28 @@ func (c *Cluster) getEnableAutoDpMetaRepair() (v bool) {
 	return
 }
 
+func (c *Cluster) setEnableDistributionOptimization(val bool) (err error) {
+	oldVal := c.EnableDistributionOptimization.Load()
+	c.EnableDistributionOptimization.Store(val)
+	if err = c.syncPutCluster(); err != nil {
+		log.LogErrorf("[setEnableDistributionOptimization] failed to set enable auto distribution optimization, err(%v)", err)
+		c.EnableDistributionOptimization.Store(oldVal)
+		err = proto.ErrPersistenceByRaft
+		return
+	}
+
+	log.LogInfof("[setEnableDistributionOptimization] changed to: %v", val)
+	return
+}
+
+func (c *Cluster) getEnableDistributionOptimization() bool {
+	return c.EnableDistributionOptimization.Load()
+}
+
+func (c *Cluster) updateEnableDistributionOptimization(val bool) {
+	c.EnableDistributionOptimization.Store(val)
+}
+
 func (c *Cluster) getDataPartitionTimeoutSec() (val int64) {
 	val = atomic.LoadInt64(&c.cfg.DataPartitionTimeOutSec)
 	if val == 0 {
@@ -4705,6 +4761,20 @@ func (c *Cluster) setForbidMpDecommission(isForbid bool) (err error) {
 		err = proto.ErrPersistenceByRaft
 		return
 	}
+	return
+}
+
+func (c *Cluster) setEnableMpDecommissionByLearner(enable bool) (err error) {
+	oldFlag := c.EnableMpDecommissionByLearner
+	c.EnableMpDecommissionByLearner = enable
+	if err = c.syncPutCluster(); err != nil {
+		log.LogErrorf("action[setEnableMpDecommissionByLearner] err[%v]", err)
+		c.EnableMpDecommissionByLearner = oldFlag
+		err = proto.ErrPersistenceByRaft
+		return
+	}
+
+	log.LogWarnf("action[setEnableMpDecommissionByLearner] old: %v, new: %v", oldFlag, enable)
 	return
 }
 
@@ -6812,6 +6882,32 @@ func (c *Cluster) checkMultipleReplicasOnSameMachine(hosts []string) (err error)
 			}
 			distinctIp[ip] = struct{}{}
 		}
+	}
+	return nil
+}
+
+func (c *Cluster) setDistributionOptimizationConDpCnt(count int64) error {
+	c.DistributionOptimizationConDpCnt.Store(count)
+	if err := c.syncPutCluster(); err != nil {
+		log.LogWarnf("setDistributionOptimizationConDpCnt: sync put cluster failed, err(%v)", err)
+		return err
+	}
+	return nil
+}
+
+func getDistributionOptimizationThreshold() float64 {
+	val := distributionOptimizationThreshold.Load()
+	if val > 0 && val <= 1 {
+		return val
+	}
+	return defaultDistributionOptimizationThreshold
+}
+
+func (c *Cluster) setDistributionOptimizationThreshold(threshold float64) error {
+	distributionOptimizationThreshold.Store(threshold)
+	if err := c.syncPutCluster(); err != nil {
+		log.LogWarnf("setDistributionOptimizationThreshold: sync put cluster failed, err(%v)", err)
+		return err
 	}
 	return nil
 }
