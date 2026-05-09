@@ -391,7 +391,7 @@ func (c *RocksDBCleaner) DoCleanRocksdbData(record *CleanRecord) error {
 	// remove files
 	filenames := []string{uniqCheckerFile, verdataFile}
 	for _, filename := range filenames {
-		filepath := path.Join(record.RootDir, snapshotDir, filename)
+		filepath := path.Join(record.RootDir, rocksdbSnapDir, filename)
 		if err = os.Remove(filepath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
@@ -415,10 +415,26 @@ func (c *RocksDBCleaner) DoCleanRocksdbData(record *CleanRecord) error {
 }
 
 func (c *RocksDBCleaner) flushAndCheckApplyID(rocksdbTree *RocksdbTree) error {
-	err := rocksdbTree.inodeTree.Flush(true)
-	if err != nil {
-		log.LogErrorf("[flushAndCheckApplyID] mp(%v) flush err: %s", rocksdbTree.PartitionId, err.Error())
-		return err
+	var diskApplyID uint64
+	for i := 0; i < TryFlushNum; i++ {
+		err := rocksdbTree.inodeTree.Flush(true)
+		if err == nil {
+			return nil
+		}
+		if err != ErrDoingFlush {
+			log.LogErrorf("[flushAndCheckApplyID] mp(%v) flush err: %s", rocksdbTree.PartitionId, err.Error())
+			return err
+		}
+
+		diskApplyID, err = rocksdbTree.inodeTree.GetApplyIdFromDisk()
+		if err != nil {
+			log.LogErrorf("[flushAndCheckApplyID] mp(%v) get apply id from disk err: %s", rocksdbTree.PartitionId, err.Error())
+			return err
+		}
+		if diskApplyID > 0 {
+			return nil
+		}
+		time.Sleep(FlushInterval)
 	}
-	return nil
+	return fmt.Errorf("[flushAndCheckApplyID] mp(%v) timeout, diskApplyID: %d", rocksdbTree.PartitionId, diskApplyID)
 }

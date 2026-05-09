@@ -552,6 +552,7 @@ type metaPartition struct {
 
 	rocksdbManager       RocksdbManager
 	db                   *RocksdbOperator
+	multiVerApplyId      uint64
 	waitPersistCommitCnt uint64
 }
 
@@ -863,7 +864,16 @@ func (mp *metaPartition) onStart(isCreate bool) (err error) {
 }
 
 func (mp *metaPartition) startScheduleTask() {
-	mp.startSchedule(mp.applyID)
+	applyID := mp.applyID
+	if mp.HasRocksDBStore() {
+		var err error
+		applyID, err = mp.inodeTree.GetApplyIdFromDisk()
+		if err != nil {
+			log.LogErrorf("[startScheduleTask] mp(%d) get applyId err: %s", mp.config.PartitionId, err.Error())
+			applyID = 0
+		}
+	}
+	mp.startSchedule(applyID)
 }
 
 func (mp *metaPartition) onStop() {
@@ -1198,51 +1208,58 @@ func (mp *metaPartition) load(isCreate bool) (err error) {
 		log.LogErrorf("[load] failed to init objects, mp(%v) err(%v)", mp.config.PartitionId, err)
 		return
 	}
-	// 1. create new metaPartition, no need to load snapshot
-	// 2. store the snapshot files for new mp, because
-	// mp.load() will check all the snapshot files when mn startup
-	// NOTE: only memory store need to create snapshot files
-	if isCreate && mp.HasMemStore() {
+	// New memory partitions need snapshot files, while new RocksDB partitions only
+	// need their selected db dir persisted into metadata.
+	if isCreate {
+		if mp.HasRocksDBStore() {
+			if err = mp.persistMetadata(); err != nil {
+				log.LogErrorf("[load] mp(%v) failed to persist rocksdb metadata, err(%v)", mp.config.PartitionId, err)
+			}
+			return
+		}
 		if err = mp.storeSnapshotFiles(); err != nil {
 			err = errors.NewErrorf("[onStart] storeSnapshotFiles for partition id=%d: %s",
 				mp.config.PartitionId, err.Error())
 		}
 		return
 	}
-	snapshotPath := ""
-	if mp.HasMemStore() {
-		snapshotPath = path.Join(mp.config.RootDir, snapshotDir)
-		if _, err = os.Stat(snapshotPath); err != nil {
-			log.LogErrorf("[load] load snapshot failed, err: %s", err.Error())
-			return nil
-		}
-		err = mp.LoadSnapshot(snapshotPath)
-	}
 
 	if mp.HasRocksDBStore() {
 		log.LogDebugf("[load] mp(%v) rocksdb dir(%v)", mp.config.PartitionId, mp.config.RocksDBDir)
 		log.LogDebugf("[load] load rocksdb data")
-		err = mp.LoadDataFromRocksDb()
-	}
-
-	if err != nil {
-		log.LogErrorf("[load] failed to load data, mp(%v) err(%v)", mp.config.PartitionId, err)
-		return err
-	}
-
-	// NOTE: snapshotPath can be empty if using rocksdb
-	if err = mp.loadApplyID(snapshotPath); err != nil {
-		log.LogErrorf("[load] failed to load apply id, mp(%v) err(%v)", mp.config.PartitionId, err)
-		return
-	}
-
-	// NOTE: when we create rocksdb mp
-	// we will select a db path and set RocksdbDir config
-	// so we need to persist metadata
-	if mp.HasRocksDBStore() {
+		if err = mp.LoadDataFromRocksDb(); err != nil {
+			log.LogErrorf("[load] failed to load rocksdb data, mp(%v) err(%v)", mp.config.PartitionId, err)
+			return err
+		}
+		if err = mp.loadRocksdbFile(); err != nil {
+			log.LogErrorf("[load] failed to load rocksdb sidecar data, mp(%v) err(%v)", mp.config.PartitionId, err)
+			return err
+		}
+		if err = mp.loadRocksdbApplyID(); err != nil {
+			log.LogErrorf("[load] failed to load rocksdb apply id, mp(%v) err(%v)", mp.config.PartitionId, err)
+			return err
+		}
+		if err = mp.ScanRocksdb(); err != nil {
+			log.LogErrorf("[load] failed to scan rocksdb, mp(%v) err(%v)", mp.config.PartitionId, err)
+			return err
+		}
 		if err = mp.persistSelectedRocksdbDir(); err != nil {
 			log.LogErrorf("[load] mp(%v) failed to persist rocksdb dir to metadata file, err(%v)", mp.config.PartitionId, err)
-			return
+			return err
+		}
+	} else {
+		snapshotPath := path.Join(mp.config.RootDir, snapshotDir)
+		if _, err = os.Stat(snapshotPath); err != nil {
+			log.LogErrorf("[load] load snapshot failed, err: %s", err.Error())
+			return nil
+		}
+		if err = mp.LoadSnapshot(snapshotPath); err != nil {
+			log.LogErrorf("[load] failed to load snapshot, mp(%v) err(%v)", mp.config.PartitionId, err)
+			return err
+		}
+		if err = mp.loadApplyID(snapshotPath); err != nil {
+			log.LogErrorf("[load] failed to load apply id, mp(%v) err(%v)", mp.config.PartitionId, err)
+			return err
 		}
 	}
 
@@ -1301,6 +1318,16 @@ func (mp *metaPartition) store(sm *storeMsg) (err error) {
 		if err = mp.inodeTree.Flush(true); err != nil {
 			return
 		}
+		if err = mp.storeRocksdbExtent(sm); err != nil {
+			log.LogErrorf("[store] mp(%v) failed to rebuild rocksdb stats from snapshot, err(%v)", mp.config.PartitionId, err)
+			return
+		}
+		if err = mp.storeRocksdbFile(sm); err != nil {
+			log.LogErrorf("[store] mp(%v) failed to store rocksdb sidecar files, err(%v)", mp.config.PartitionId, err)
+			return
+		}
+		mp.mqMgr.statisticRebuildFin(sm.quotaRebuild)
+		mp.acucumRebuildFin(sm.uidRebuild)
 		mp.storedApplyId = applyIndex
 		return nil
 	}
@@ -2217,6 +2244,27 @@ func (mp *metaPartition) LoadDataFromRocksDb() (err error) {
 	}
 	log.LogDebugf("[LoadDataFromRocksDb] mp(%v) load tx id(%v)", mp.config.PartitionId, mp.txProcessor.txManager.txIdAlloc.getTransactionID())
 	return
+}
+
+func (mp *metaPartition) ScanRocksdb() error {
+	maxInode, err := mp.loadRocksdbInode()
+	if err != nil {
+		log.LogErrorf("[ScanRocksdb] mp(%d) scan inode failed: %s", mp.config.PartitionId, err.Error())
+		return err
+	}
+
+	if maxInode > atomic.LoadUint64(&mp.config.Cursor) {
+		log.LogWarnf("[ScanRocksdb] mp(%d) set cursor from (%v) to (%v)",
+			mp.config.PartitionId, atomic.LoadUint64(&mp.config.Cursor), maxInode)
+		atomic.StoreUint64(&mp.config.Cursor, maxInode)
+	}
+
+	if err = mp.loadRocksdbExtent(); err != nil {
+		log.LogErrorf("[ScanRocksdb] mp(%d) scan extent failed: %s", mp.config.PartitionId, err.Error())
+		return err
+	}
+
+	return nil
 }
 
 func (mp *metaPartition) Clear() (err error) {
