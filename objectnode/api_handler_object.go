@@ -1072,6 +1072,7 @@ func (o *ObjectNode) getBucketV1Handler(w http.ResponseWriter, r *http.Request) 
 		Bucket:         param.Bucket(),
 		Prefix:         prefix,
 		Marker:         marker,
+		EncodingType:   encodingType,
 		MaxKeys:        int(maxKeysInt),
 		Delimiter:      delimiter,
 		IsTruncated:    result.Truncated,
@@ -1235,6 +1236,7 @@ func (o *ObjectNode) getBucketV2Handler(w http.ResponseWriter, r *http.Request) 
 	listBucketResult := ListBucketResultV2{
 		Name:           param.Bucket(),
 		Prefix:         prefix,
+		EncodingType:   encodingType,
 		Token:          contToken,
 		NextToken:      result.NextToken,
 		KeyCount:       result.KeyCount,
